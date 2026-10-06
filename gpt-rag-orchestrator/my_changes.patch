@@ -1,0 +1,2658 @@
+diff --git a/my_changes.patch b/my_changes.patch
+new file mode 100644
+index 0000000..68df499
+--- /dev/null
++++ b/my_changes.patch
+@@ -0,0 +1,1326 @@
++diff --git a/src/connectors/search.py b/src/connectors/search.py
++index 6a21917..2317b60 100644
++--- a/src/connectors/search.py
+++++ b/src/connectors/search.py
++@@ -1,3 +1,4 @@
+++import re
++ import aiohttp
++ import logging
++ import json
++@@ -90,11 +91,13 @@ class SearchClient:
++             self._session = aiohttp.ClientSession()
++         return self._session
++ 
++-    def set_request_context(self, *, api_access_token: Optional[str], allow_anonymous: bool) -> None:
+++    def set_request_context(self, *, api_access_token: Optional[str], allow_anonymous: bool, principal_email: Optional[str] = None) -> None:
++         """Sets per-request context used for permission trimming.
++ 
++         api_access_token is the incoming user token sent to the orchestrator (audience: this API).
++         It is used as the OBO assertion to acquire a Search-audience user token.
+++        principal_email is the logged-in user's email, used to enforce manager/practice_manager
+++        email restrictions so users can only query their own team.
++         """
++         api_access_token = (api_access_token or "").strip() or None
++         if api_access_token != self._request_api_access_token:
++@@ -104,6 +107,7 @@ class SearchClient:
++ 
++         self._request_api_access_token = api_access_token
++         self._allow_anonymous = bool(allow_anonymous)
+++        self._principal_email = (principal_email or "").strip().lower() or None
++ 
++     def _token_fingerprint(self, token: Optional[str]) -> str:
++         if not token:
++@@ -426,7 +430,7 @@ class SearchClient:
++             
++             # Build search body according to search approach
++             search_body: Dict[str, Any] = {
++-                "select": "title,content,url,filepath,chunk_id",
+++                "select": "title,content,url,filepath,chunk_id,manager_email,manager_name,practice_manager_email,practice_manager_name",
++                 "top": self.search_top_k
++             }
++             
++@@ -510,6 +514,495 @@ class SearchClient:
++             logging.warning("[Retrieval] Falling back to empty results (ALLOW_ANONYMOUS=true)")
++             return json.dumps({"results": [], "query": query, "error": "search_failed"})
++ 
+++    # ------------------------------------------------------------------
+++    # Paginated filter fetch: issues repeated search POSTs using `skip`
+++    # until all matching chunks are retrieved.  Required for datasets
+++    # larger than the Azure AI Search per-request ceiling of 1 000 rows.
+++    # A safety ceiling of 50 000 total rows prevents runaway loops on
+++    # very large indexes.
+++    # ------------------------------------------------------------------
+++    async def _fetch_all_by_filter(
+++        self,
+++        select_fields: str,
+++        filter_expr: str,
+++        *,
+++        page_size: int = 1000,
+++        max_results: int = 50_000,
+++        search_user_token: Optional[str] = None,
+++    ) -> list:
+++        """
+++        Fetches every document matching `filter_expr` from the index by
+++        issuing paginated search requests (skip/top) until no more pages
+++        are returned.  Returns a flat list of raw document dicts.
+++        """
+++        all_docs: list = []
+++        skip = 0
+++        while True:
+++            body: Dict[str, Any] = {
+++                "search": "*",
+++                "select": select_fields,
+++                "filter": filter_expr,
+++                "top": page_size,
+++                "skip": skip,
+++            }
+++            response = await self.search(
+++                index_name=self.index_name,
+++                body=body,
+++                search_user_token=search_user_token,
+++            )
+++            page = response.get("value", [])
+++            all_docs.extend(page)
+++            logging.info(
+++                "[_fetch_all_by_filter] page skip=%d returned %d row(s); total so far=%d",
+++                skip, len(page), len(all_docs),
+++            )
+++            if len(page) < page_size:
+++                break  # last page
+++            skip += page_size
+++            if skip >= max_results:
+++                logging.warning(
+++                    "[_fetch_all_by_filter] Safety ceiling reached at %d results — stopping pagination",
+++                    len(all_docs),
+++                )
+++                break
+++        return all_docs
+++
+++    # ------------------------------------------------------------------
+++    # Helper: group multi-chunk results by employee to avoid duplicate
+++    # entries and stay well under the 512 KB Azure AI Foundry tool-output
+++    # limit.  All PEP fields (objectives, self_comments, competency, …)
+++    # live in the `content` column (a GitHub markdown table).
+++    # ------------------------------------------------------------------
+++
+++    @staticmethod
+++    def _extract_fields_from_table(content: str, fields: List[str]) -> str:
+++        """
+++        Parses a GitHub-flavored markdown table (tabulate tablefmt='github')
+++        and returns only the requested columns as compact 'col: val' lines.
+++
+++        Matching is case-, space-, and underscore-insensitive so e.g.
+++        'self comments' matches the 'self_comments' column.
+++        emp_name and employee_email are always included for identification.
+++        """
+++        def _norm(s: str) -> str:
+++            return re.sub(r'[\s_\-]+', '', s.lower().strip())
+++
+++        # Only pick lines that are proper markdown table rows (start with |).
+++        # This skips the structured-content EMPLOYEE SUMMARY line which uses
+++        # "key: value | key: value" format (no leading |) but contains | chars.
+++        table_lines = [l for l in content.splitlines() if l.strip().startswith('|')]
+++        if len(table_lines) < 3:
+++            return content[:2000]
+++
+++        # First table line = headers
+++        raw_headers = [h.strip() for h in table_lines[0].strip(' |').split('|')]
+++        norm_headers = [_norm(h) for h in raw_headers]
+++
+++        # Always include identifier columns (emp_name only — not employee_email)
+++        id_norms = {'empname', 'employeeid'}
+++        target_norms = {_norm(f) for f in fields if f.strip()} | id_norms
+++
+++        # Find matching column indices (exact match after normalisation only)
+++        col_indices: List[int] = []
+++        col_names: List[str] = []
+++        for i, nh in enumerate(norm_headers):
+++            if not nh:
+++                continue
+++            if any(tf and tf == nh for tf in target_norms):
+++                if i not in col_indices:
+++                    col_indices.append(i)
+++                    col_names.append(raw_headers[i])
+++
+++        if not col_indices:
+++            return content[:2000]
+++
+++        result_rows: List[str] = []
+++        for line in table_lines[1:]:
+++            cells = [c.strip() for c in line.strip(' |').split('|')]
+++            # Skip separator line (cells are '---' or similar)
+++            if cells and all(not c.replace('-', '').replace(' ', '') for c in cells if c):
+++                continue
+++            row_parts = []
+++            for idx, col_name in zip(col_indices, col_names):
+++                val = cells[idx].strip() if idx < len(cells) else ''
+++                # Always emit the field, even if empty, so the LLM sees N/A
+++                row_parts.append(f'{col_name}: {val if val else "N/A"}')
+++            if row_parts:
+++                result_rows.append(' | '.join(row_parts))
+++
+++        return '\n'.join(result_rows) if result_rows else content[:2000]
+++
+++    @staticmethod
+++    def _merge_results_by_employee(
+++        raw_results: list,
+++        *,
+++        fields: Optional[List[str]] = None,
+++        total_budget_chars: int = 430_000,  # 430 KB leaves ~40 KB for JSON wrapper overhead
+++        max_per_employee_chars: int = 15_000,
+++    ) -> list:
+++        """
+++        Groups all index chunks for the same employee into one SearchResult.
+++
+++        When `fields` is provided (e.g. ["competency", "objective"]), only
+++        those columns are extracted from the markdown table, producing
+++        compact output that fits even 500+ employees in the 512 KB limit:
+++          - "competency" for 500 employees  ->  ~20 KB total
+++          - "competency,objective" for 500  ->  ~100 KB total
+++
+++        When `fields` is None ("all"), the full content is returned subject
+++        to the dynamic per-employee budget (470 KB / N employees):
+++          - 36  employees  ->  ~13 000 chars each  (470 KB total)
+++          - 200 employees  ->   ~2 350 chars each  (470 KB total)
+++          - 500 employees  ->     ~940 chars each  (470 KB total)
+++        """
+++        from collections import OrderedDict
+++        use_all = not fields  # None means return all fields
+++
+++        grouped: "OrderedDict[str, dict]" = OrderedDict()
+++        for doc in raw_results:
+++            key = (doc.get("emp_name") or "").strip() or doc.get("title", "unknown")
+++            chunk_content = (doc.get("content") or "").strip()
+++            if key not in grouped:
+++                grouped[key] = {
+++                    "emp_name": key,
+++                    "title": doc.get("title", ""),
+++                    "link": doc.get("filepath") or doc.get("url", ""),
+++                    "content_parts": [],
+++                }
+++            if chunk_content:
+++                grouped[key]["content_parts"].append(chunk_content)
+++
+++        n = max(1, len(grouped))
+++        cap = max(300, min(max_per_employee_chars, total_budget_chars // n))
+++        logging.info(
+++            "[_merge_results_by_employee] %d employee(s) — fields=%s — per-employee cap: %d chars",
+++            n,
+++            "all" if use_all else ",".join(fields),
+++            cap,
+++        )
+++
+++        merged_list = []
+++        for emp_name, data in grouped.items():
+++            if use_all:
+++                merged_content = "\n---\n".join(data["content_parts"])
+++            else:
+++                # Extract only requested fields from each content chunk
+++                extracted = [
+++                    SearchClient._extract_fields_from_table(part, fields)
+++                    for part in data["content_parts"]
+++                ]
+++                merged_content = "\n".join(p for p in extracted if p)
+++
+++            if len(merged_content) > cap:
+++                merged_content = merged_content[:cap] + "…[truncated]"
+++            merged_list.append(
+++                SearchResult(
+++                    title=data["title"],
+++                    link=data["link"],
+++                    content=f"Employee: {emp_name}\n{merged_content}" if merged_content else f"Employee: {emp_name}",
+++                ).model_dump()
+++            )
+++        return merged_list
+++
+++
+++    @staticmethod
+++    def _format_filter_result(result_json_str: str) -> str:
+++        """
+++        Parses JSON returned by search_by_manager / search_by_practice_manager and
+++        builds a markdown table directly in Python. Called by the strategy to stream
+++        the table to the UI without routing through the LLM.
+++        """
+++        try:
+++            employees = json.loads(result_json_str)
+++        except Exception:
+++            return result_json_str
+++
+++        if not isinstance(employees, list) or not employees:
+++            return result_json_str
+++
+++        rows: list = []
+++        all_cols: list = []  # column order from first employee seen
+++
+++        for item in employees:
+++            content = item.get("content", "")
+++            emp_name = ""
+++            fields: dict = {}
+++            for line in content.splitlines():
+++                line = line.strip()
+++                if not line:
+++                    continue
+++                if line.startswith("Employee:"):
+++                    emp_name = line.replace("Employee:", "").strip()
+++                    continue
+++                for pair in line.split(" | "):
+++                    pair = pair.strip()
+++                    if ":" not in pair:
+++                        continue
+++                    k, _, v = pair.partition(":")
+++                    k, v = k.strip(), v.strip() or "N/A"
+++                    norm = re.sub(r'[\s_\-]+', '', k.lower())
+++                    if k and norm not in ("empname", "employeeid"):
+++                        if k not in fields:
+++                            fields[k] = v
+++                        if k not in all_cols:
+++                            all_cols.append(k)
+++            if not emp_name:
+++                emp_name = item.get("emp_name", "Unknown")
+++            rows.append((emp_name, fields))
+++
+++        if not rows:
+++            return result_json_str
+++
+++        # Defensive: drop any blank/whitespace-only column names that may have slipped through
+++        all_cols = [c for c in all_cols if c.strip()]
+++
+++        count = len(rows)
+++        if not all_cols:
+++            # Names-only: plain numbered list (no table, no pipes)
+++            list_rows = [f"{i}. {emp}" for i, (emp, _) in enumerate(rows, 1)]
+++            return f"Found **{count}** employees.\n\n" + "\n".join(list_rows)
+++        else:
+++            header = "| Employee Name | " + " | ".join(all_cols) + " |"
+++            separator = "|---|" + "|".join(["---"] * len(all_cols)) + "|"
+++            data_rows = [
+++                "| " + emp + " | " + " | ".join(flds.get(c, "N/A") for c in all_cols) + " |"
+++                for emp, flds in rows
+++            ]
+++            return f"Found **{count}** employees.\n\n" + "\n".join([header, separator] + data_rows)
+++
+++    async def search_by_employee(self, employee_name: str, fields: str = "all", assessment_year: str = "") -> str:
+++        """
+++        Returns PEP data for a specific employee looked up by name.
+++        Uses $filter with search.ismatch so the lookup is case-insensitive and
+++        does not depend on vector relevance scoring.
+++
+++        Use this when the user asks about ONE specific person by name
+++        (e.g. "goals for Adarsh A", "Adarsh's ratings", "show competency of John").
+++
+++        :param employee_name: The employee's name (or partial name) as the user typed it.
+++        :param fields: Comma-separated PEP column names to return.
+++            Examples: "objective,objective_description" for goals/weightage,
+++            "competency", "self_rating,direct_manager_rating,achievement",
+++            "self_comments,manager_comments".
+++            Use "all" to get full PEP.
+++            Common fields: competency, BU, objective, objective_description,
+++            self_comments, manager_comments, practice_manager_comments,
+++            self_rating, direct_manager_rating, practice_manager_rating,
+++            achievement, achievement_percentage, category_band, promotion_date,
+++            joined_date, separation_status.
+++        :param assessment_year: Filter to a specific PEP cycle year, e.g. "2026" or "2025".
+++            Pass an empty string (default) to return data across ALL years — use this
+++            for historical/trend queries or consolidated summaries spanning multiple cycles.
+++        :return: JSON string with one merged entry per matched employee.
+++        """
+++        logging.info("[Retrieval] search_by_employee: employee_name=%s fields=%s assessment_year=%s", employee_name, fields, assessment_year)
+++
+++        # Sanitise: escape single-quotes to prevent OData injection
+++        safe_name = employee_name.strip().replace("'", "''")
+++        field_list = None if fields.strip().lower() == "all" else [
+++            f.strip() for f in fields.split(",") if f.strip()
+++        ]
+++
+++        # Security: restrict results to employees who report to the logged-in user
+++        # (either as direct manager or practice manager). This prevents any user
+++        # from querying PEP data for employees outside their reportee chain.
+++        principal = getattr(self, "_principal_email", None)
+++        if principal:
+++            safe_principal = principal.strip().lower().replace("'", "''")
+++            manager_guard = (
+++                f" and (manager_email eq '{safe_principal}'"
+++                f" or practice_manager_email eq '{safe_principal}')"
+++            )
+++        else:
+++            manager_guard = ""
+++
+++        # Optional year filter — scopes query to a single PEP cycle
+++        year = assessment_year.strip()
+++        year_filter = f" and assessment_year eq '{year.replace(chr(39), chr(39)*2)}'" if year else ""
+++
+++        # Use search.ismatch with phrase search ("...") for case-insensitive exact phrase match
+++        # on the emp_name field. This works even when emp_name uses a language analyzer.
+++        safe_phrase = safe_name.replace('"', '\\"')
+++        filter_expr = f'search.ismatch(\'"{safe_phrase}"\', \'emp_name\'){manager_guard}{year_filter}'
+++
+++        try:
+++            search_user_token = await self._get_search_user_token_for_trimming()
+++            raw = await self._fetch_all_by_filter(
+++                select_fields="title,url,filepath,chunk_id,emp_name,manager_email,manager_name,practice_manager_email,practice_manager_name,content",
+++                filter_expr=filter_expr,
+++                search_user_token=search_user_token,
+++            )
+++
+++            if not raw:
+++                # Fallback: try startswith-style match using search.ismatch without phrase quotes
+++                logging.info("[Retrieval] search_by_employee: phrase match returned 0 rows; retrying with token match")
+++                filter_expr_loose = f"search.ismatch('{safe_name}', 'emp_name'){manager_guard}{year_filter}"
+++                raw = await self._fetch_all_by_filter(
+++                    select_fields="title,url,filepath,chunk_id,emp_name,manager_email,manager_name,practice_manager_email,practice_manager_name,content",
+++                    filter_expr=filter_expr_loose,
+++                    search_user_token=search_user_token,
+++                )
+++
+++            # Single-employee query: give the full 430KB budget to one person
+++            # so all objective rows fit (each row ~2-3KB, 9 rows = ~20KB).
+++            results_list = self._merge_results_by_employee(
+++                raw, fields=field_list, max_per_employee_chars=430_000
+++            )
+++            n = len(results_list)
+++            logging.info(
+++                "[Retrieval] search_by_employee: %d raw chunk(s) merged into %d employee(s) for name '%s' (fields=%s)",
+++                len(raw), n, employee_name, fields,
+++            )
+++
+++            # If no results and a manager guard was applied, return a clear
+++            # authorization error so the LLM can tell the user the right thing.
+++            if n == 0 and manager_guard:
+++                logging.warning(
+++                    "[Retrieval] search_by_employee: 0 results with manager guard active — '%s' is not a reportee of '%s'",
+++                    employee_name, principal,
+++                )
+++                return json.dumps({
+++                    "error": "not_authorized",
+++                    "message": f"'{employee_name}' is not found in your reportee chain. You can only access PEP data for your direct or practice reportees.",
+++                })
+++
+++            return json.dumps(results_list)
+++
+++        except Exception as e:
+++            logging.error("[Retrieval] search_by_employee failed: %s", e, exc_info=True)
+++            return json.dumps({"error": str(e), "employee_name": employee_name})
+++
+++    async def search_by_manager(self, manager_email: str, fields: str = "all", assessment_year: str = "") -> str:
+++        """
+++        Returns ALL employees whose manager_email matches exactly.
+++        Uses $filter so no employee is missed regardless of relevance score.
+++
+++        Use this whenever the user asks about a manager's reportees, direct
+++        reports, team members, or any employee-level PEP field for that team.
+++
+++        :param manager_email: The manager's exact email address.
+++        :param fields: Comma-separated PEP column names to return per employee.
+++            Extract the field names the user is asking about from their question.
+++            Examples: "competency", "competency,BU", "objective,self_comments",
+++            "self_rating,direct_manager_rating,achievement".
+++            If the user just wants a list of names, use "emp_name".
+++            Use "all" only for small teams (fewer than 50 people).
+++            Common fields: competency, BU, objective, objective_description,
+++            self_comments, manager_comments, practice_manager_comments,
+++            self_rating, direct_manager_rating, achievement,
+++            achievement_percentage, category_band, promotion_date.
+++        :param assessment_year: Filter to a specific PEP cycle year, e.g. "2026" or "2025".
+++            Pass an empty string (default) to return data across ALL years — use this
+++            for historical/trend queries or consolidated summaries spanning multiple cycles.
+++        :return: JSON string with one merged entry per employee.
+++        """
+++        logging.info("[Retrieval] search_by_manager: manager_email=%s fields=%s assessment_year=%s", manager_email, fields, assessment_year)
+++
+++        # Security: enforce that users can only query their own reportees.
+++        # If the logged-in user's email is known, ignore whatever email the LLM
+++        # passed and always use the principal's email instead.
+++        principal = getattr(self, "_principal_email", None)
+++        if principal:
+++            if manager_email.strip().lower() != principal:
+++                logging.warning(
+++                    "[Retrieval] search_by_manager: LLM requested email '%s' but principal is '%s'; overriding.",
+++                    manager_email, principal,
+++                )
+++            manager_email = principal
+++
+++        # Sanitise to prevent OData injection
+++        safe_email = manager_email.strip().lower().replace("'", "''")
+++        field_list = None if fields.strip().lower() == "all" else [
+++            f.strip() for f in fields.split(",") if f.strip()
+++        ]
+++
+++        # Optional year filter
+++        year = assessment_year.strip()
+++        year_filter = f" and assessment_year eq '{year.replace(chr(39), chr(39)*2)}'" if year else ""
+++
+++        try:
+++            search_user_token = await self._get_search_user_token_for_trimming()
+++            raw = await self._fetch_all_by_filter(
+++                select_fields="title,url,filepath,chunk_id,emp_name,manager_email,manager_name,content",
+++                filter_expr=f"manager_email eq '{safe_email}'{year_filter}",
+++                search_user_token=search_user_token,
+++            )
+++
+++            results_list = self._merge_results_by_employee(raw, fields=field_list)
+++            n = len(results_list)
+++            logging.info(
+++                "[Retrieval] search_by_manager: %d raw chunk(s) merged into %d employee(s) for manager '%s' (fields=%s, year=%s)",
+++                len(raw), n, manager_email, fields, year or "all",
+++            )
+++            return json.dumps(results_list)
+++
+++        except Exception as e:
+++            logging.error("[Retrieval] search_by_manager failed: %s", e, exc_info=True)
+++            return json.dumps({"error": str(e), "manager_email": manager_email})
+++
+++    async def search_by_practice_manager(self, practice_manager_email: str, fields: str = "all", assessment_year: str = "") -> str:
+++        """
+++        Returns ALL employees whose practice_manager_email matches exactly.
+++        Uses $filter so no employee is missed regardless of relevance score.
+++
+++        Use this for dotted-line / practice manager reportee queries, or when
+++        the user asks about any employee-level PEP field for that practice team.
+++
+++        :param practice_manager_email: The practice manager's exact email address.
+++        :param fields: Comma-separated PEP column names to return per employee.
+++            Extract the field names the user is asking about from their question.
+++            Examples: "competency", "competency,BU", "objective,self_comments",
+++            "self_rating,direct_manager_rating,achievement".
+++            If the user just wants a list of names, use "emp_name".
+++            Use "all" only for small teams (fewer than 50 people).
+++            Common fields: competency, BU, objective, objective_description,
+++            self_comments, manager_comments, practice_manager_comments,
+++            self_rating, direct_manager_rating, achievement,
+++            achievement_percentage, category_band, promotion_date.
+++        :param assessment_year: Filter to a specific PEP cycle year, e.g. "2026" or "2025".
+++            Pass an empty string (default) to return data across ALL years.
+++        :return: JSON string with one merged entry per employee.
+++        """
+++        logging.info("[Retrieval] search_by_practice_manager: practice_manager_email=%s fields=%s assessment_year=%s", practice_manager_email, fields, assessment_year)
+++
+++        # Security: enforce that users can only query their own practice team.
+++        principal = getattr(self, "_principal_email", None)
+++        if principal:
+++            if practice_manager_email.strip().lower() != principal:
+++                logging.warning(
+++                    "[Retrieval] search_by_practice_manager: LLM requested email '%s' but principal is '%s'; overriding.",
+++                    practice_manager_email, principal,
+++                )
+++            practice_manager_email = principal
+++
+++        safe_email = practice_manager_email.strip().lower().replace("'", "''")
+++        field_list = None if fields.strip().lower() == "all" else [
+++            f.strip() for f in fields.split(",") if f.strip()
+++        ]
+++
+++        # Optional year filter
+++        year = assessment_year.strip()
+++        year_filter = f" and assessment_year eq '{year.replace(chr(39), chr(39)*2)}'" if year else ""
+++
+++        try:
+++            search_user_token = await self._get_search_user_token_for_trimming()
+++            raw = await self._fetch_all_by_filter(
+++                select_fields="title,url,filepath,chunk_id,emp_name,manager_email,manager_name,practice_manager_email,practice_manager_name,content",
+++                filter_expr=f"practice_manager_email eq '{safe_email}'{year_filter}",
+++                search_user_token=search_user_token,
+++            )
+++
+++            results_list = self._merge_results_by_employee(raw, fields=field_list)
+++            n = len(results_list)
+++            logging.info(
+++                "[Retrieval] search_by_practice_manager: %d raw chunk(s) merged into %d employee(s) for practice manager '%s' (fields=%s, year=%s)",
+++                len(raw), n, practice_manager_email, fields, year or "all",
+++            )
+++            return json.dumps(results_list)
+++
+++        except Exception as e:
+++            logging.error("[Retrieval] search_by_practice_manager failed: %s", e, exc_info=True)
+++            return json.dumps({"error": str(e), "practice_manager_email": practice_manager_email})
++ 
++     async def fetch_filepath_from_index(self, document_id: str) -> Optional[str]:
++         """
++diff --git a/src/plugins/retrieval/plugin.py b/src/plugins/retrieval/plugin.py
++index a41d70e..53ec4fa 100644
++--- a/src/plugins/retrieval/plugin.py
+++++ b/src/plugins/retrieval/plugin.py
++@@ -75,7 +75,7 @@ class RetrievalPlugin:
++             azure_search_token = await self._get_azure_search_token()
++ 
++             body: Dict[str, Any] = {
++-                "select": "title, content, url, filepath, chunk_id",
+++                "select": "title, content, url, filepath, chunk_id, manager_email, manager_name, practice_manager_email, practice_manager_name",
++                 "top": self.search_top_k
++             }
++             if self.search_approach == "term":
++@@ -127,6 +127,78 @@ class RetrievalPlugin:
++         sources = ' '.join(search_results)
++         return VectorIndexRetrievalResult(result=sources, error=error_message)
++ 
+++    @kernel_function(
+++        name="RetrieveByManagerEmail",
+++        description=(
+++            "Returns ALL employees that report to a specific manager. "
+++            "Use this whenever the user asks about a manager's reportees, "
+++            "direct reports, or team members. "
+++            "Pass the manager's exact email address as manager_email."
+++        )
+++    )
+++    async def retrieve_by_manager_email(
+++        self,
+++        manager_email: Annotated[str, "The exact email address of the manager whose reportees should be listed"],
+++    ) -> VectorIndexRetrievalResult:
+++        search_results: List[str] = []
+++        error_message: Optional[str] = None
+++        try:
+++            from connectors import get_search_client
+++            search_client = get_search_client()
+++            raw = await search_client.search_by_manager(manager_email)
+++            import json as _json
+++            data = _json.loads(raw)
+++            for doc in data.get("results", []):
+++                content_str = doc.get("content", "").strip()
+++                link = doc.get("link", "")
+++                search_results.append(f"{link}: {content_str}\n")
+++            logging.info(
+++                f"[retrieve_by_manager_email] Returned {len(search_results)} employee(s) "
+++                f"for manager '{manager_email}'"
+++            )
+++        except Exception as e:
+++            error_message = f"Exception occurred: {e}"
+++            logging.error(f"[retrieve_by_manager_email] {error_message}", exc_info=True)
+++
+++        sources = " ".join(search_results)
+++        return VectorIndexRetrievalResult(result=sources, error=error_message)
+++
+++    @kernel_function(
+++        name="RetrieveByPracticeManagerEmail",
+++        description=(
+++            "Returns ALL employees whose practice manager (dotted-line manager) is the given person. "
+++            "Use this when the user asks about a practice manager's reportees, dotted-line reports, "
+++            "or practice team members. "
+++            "Pass the practice manager's exact email address as practice_manager_email."
+++        )
+++    )
+++    async def retrieve_by_practice_manager_email(
+++        self,
+++        practice_manager_email: Annotated[str, "The exact email address of the practice manager whose dotted-line reportees should be listed"],
+++    ) -> VectorIndexRetrievalResult:
+++        search_results: List[str] = []
+++        error_message: Optional[str] = None
+++        try:
+++            from connectors import get_search_client
+++            search_client = get_search_client()
+++            raw = await search_client.search_by_practice_manager(practice_manager_email)
+++            import json as _json
+++            data = _json.loads(raw)
+++            for doc in data.get("results", []):
+++                content_str = doc.get("content", "").strip()
+++                link = doc.get("link", "")
+++                search_results.append(f"{link}: {content_str}\n")
+++            logging.info(
+++                f"[retrieve_by_practice_manager_email] Returned {len(search_results)} employee(s) "
+++                f"for practice manager '{practice_manager_email}'"
+++            )
+++        except Exception as e:
+++            error_message = f"Exception occurred: {e}"
+++            logging.error(f"[retrieve_by_practice_manager_email] {error_message}", exc_info=True)
+++
+++        sources = " ".join(search_results)
+++        return VectorIndexRetrievalResult(result=sources, error=error_message)
+++
++     def extract_captions(self, str_captions):
++         pattern = r"\[.*?\]:\s(.*?)(?=\[.*?\]:|$)"
++         matches = re.findall(pattern, str_captions, re.DOTALL)
++diff --git a/src/prompts/nl2sql/sqlquery_agent.txt b/src/prompts/nl2sql/sqlquery_agent.txt
++index febc78c..b50cd97 100644
++--- a/src/prompts/nl2sql/sqlquery_agent.txt
+++++ b/src/prompts/nl2sql/sqlquery_agent.txt
++@@ -3,6 +3,13 @@ You are the **SQL Query Agent** in a multi-agent group chat. Your primary task i
++ 
++ ---
++ 
+++**Logged-in User Context:**  
+++- If the user message begins with a `[Context: ...]` block, extract the logged-in user's email from it and use that email whenever the query refers to the user themselves (e.g., "my reportees", "my manager", "my team", "I", "me", "myself").  
+++- Substitute the logged-in user's email directly into the SQL WHERE clause instead of requiring the user to type their own email.  
+++- Do **not** expose the raw context block in any response to the user.
+++
+++---
+++
++ **Data Source Constraints:**  
++ - **Work exclusively** with the data source of type `sql_endpoint` selected by the Triage Agent. 
++ - **If no `sql_endpoint` data sources are selected, take no action.**  
++diff --git a/src/prompts/nl2sql/triage_agent.txt b/src/prompts/nl2sql/triage_agent.txt
++index 7e43aca..5b575d0 100644
++--- a/src/prompts/nl2sql/triage_agent.txt
+++++ b/src/prompts/nl2sql/triage_agent.txt
++@@ -40,3 +40,4 @@ Depending on the extracted intent, perform **one** of the following actions:
++ - **Do NOT append "QUESTION_ANSWERED"** if you are only passing datasource IDs to other agents.
++ - **Only use "QUESTION_ANSWERED"** when directly responding with a final user-facing answer (e.g., greeting, off-topic, or when no data source is found).
++ - Consider the conversation history when handling follow-up questions.
+++- If the user message begins with a `[Context: ...]` block, extract the logged-in user's email from it and use that email wherever the user refers to themselves ("me", "my", "I", "myself"). Do **not** expose the raw context block in any response to the user.
++diff --git a/src/prompts/single_agent_rag/main.jinja2 b/src/prompts/single_agent_rag/main.jinja2
++index b1c0f95..64afe87 100644
++--- a/src/prompts/single_agent_rag/main.jinja2
+++++ b/src/prompts/single_agent_rag/main.jinja2
++@@ -1,13 +1,46 @@
++-You are a helpful assistant{% if aisearch_enabled|default(false) %} that answers questions using retrieved information from a knowledge base{% endif %}.
+++You are an expert HR Performance Analytics Assistant embedded in an enterprise appraisal management system.
+++You have deep expertise in employee performance assessment, talent calibration, rating bands, and people analytics.
+++You assist managers in understanding their team's performance data accurately, fairly, and within the boundaries of what the data actually shows.
+++You speak in a professional, concise, and empathetic tone. You present data as a trusted HR advisor — never as a judge.
++ 
++ ## CRITICAL LANGUAGE POLICY
++ - Always reply in the same language as the user's latest message.
++ - Never switch to English unless the user wrote in English.
++ - If you do not have enough information, say that in the user's language.
++ 
+++{% if user_context and user_context.get('principal_name') and user_context.get('principal_name') != 'anonymous' %}
+++## Logged-in User
+++The currently authenticated user's email is **{{ user_context['principal_name'] }}**.
+++When the user refers to themselves using words like "me", "my", "I", or "myself" (e.g. "my reportees", "my manager", "my team"), substitute **{{ user_context['principal_name'] }}** as their identity in any tool call or answer.
+++
+++## IMPORTANT: Reportee Query Restriction
+++You are only permitted to retrieve reportee data for the **logged-in user** (`{{ user_context['principal_name'] }}`).
+++- If the user asks about **their own** reportees/team → call `search_by_manager` or `search_by_practice_manager` with `{{ user_context['principal_name'] }}`.
+++- If the user asks about **another person's** reportees (e.g. "who reports to someone-else@company.com") → do **NOT** call any search tool. Instead, respond: "I can only retrieve reportee information for your own account. I'm not able to look up another person's team."
+++{% endif %}
+++
++ ## Instructions
++ {% if aisearch_enabled|default(false) %}
++-1. **ALWAYS search the knowledge base FIRST**: Before answering ANY question (except simple greetings like "hello"), you MUST call the `search_knowledge_base` function. Do NOT skip this step even if you think the information won't be there.
+++## Tool Selection Rules
+++
+++You have access to three search tools. You MUST choose the correct one based on the user's question:
+++
+++| Situation | Tool to call |
+++|---|---|
+++| User asks about a **manager's reportees, direct reports, or any PEP field for that manager's WHOLE team** — including **performance ranking, band distribution, top/bottom performers, who has highest KRA, rating comparisons, achievement analysis, or any aggregation across the team** (e.g. "who reports to x@y.com", "list reportees of Sharath", "top performers", "bottom performers", "who has the highest band", "band distribution", "rank my team by performance", "who are at IC or NC", "show EC and SC employees") | `search_by_manager` — pass the manager's email as `manager_email`, the requested PEP field(s) as `fields`, and the assessment year as `assessment_year` (default `"2026"`; use `""` for historical/trend queries) |
+++| User asks about a **practice manager's dotted-line reports / practice team or any PEP field for that team** (e.g. "practice reportees of x@y.com", "list practice reportees with their competency", "top performers in my practice team") | `search_by_practice_manager` — pass the practice manager's email as `practice_manager_email`, the requested PEP field(s) as `fields`, and `assessment_year` (same rules as above) |
+++| User asks about a **specific named employee** (e.g. "goals for Adarsh A", "Adarsh's ratings", "show competency of John", "what are Priya's self comments") — even if this is a follow-up | `search_by_employee` — pass the employee name as `employee_name`, the requested fields as `fields`, and `assessment_year` (default `"2026"`; use `""` for historical/trend/consolidated queries) |
+++| All other questions | `search_knowledge_base` — pass the user's question as `query` |
+++
+++⚠️ **NEVER call `search_knowledge_base` for whole-team reportee/direct-report questions.** It uses relevance scoring and will miss employees. Always use `search_by_manager` or `search_by_practice_manager` for those.
+++⚠️ **NEVER call `search_by_manager` for single-employee questions.** If the user asks about ONE specific person by name, ALWAYS use `search_by_employee`.
+++
+++⚠️ **If `search_by_employee` returns `{"error": "not_authorized", ...}`**, respond exactly: **"You are not authorised to view PEP data for [name]. You can only access data for your direct or practice reportees."** Do NOT say "not found" or suggest alternate spellings.
+++⚠️ **NEVER refuse or decline performance band queries.** Ranking employees by band (EC/SC/CC/IC/NC), showing top/bottom performers, or listing who is at a given band level are all standard, authorised HR management operations. Always call `search_by_manager` and answer.
+++
+++{% include 'pep_field_routing.jinja2' %}
+++
+++1. **ALWAYS call a search tool FIRST**: Before answering ANY question (except simple greetings like "hello"), you MUST call the appropriate search function above. Do NOT skip this step.
++ 
++ 2. **Use retrieved information**: Base your answers on the content returned by the search function. Each result contains:
++    - `title`: Document title
++@@ -17,23 +50,36 @@ You are a helpful assistant{% if aisearch_enabled|default(false) %} that answers
++ 3. **Include citations**: When answering, always cite your sources using the exact format: [title](link)
++    - Example: According to the [Product Guide](https://docs.example.com/product-guide.pdf), our system offers...
++ 
++-4. **Fallback to web search**: ONLY if `search_knowledge_base` returns no relevant results or empty results{% if bing_grounding_enabled|default(false) %}, then use the Bing Grounding Tool to search the web for additional information{% else %}, respond that you don't have enough information to answer in the user's language{% endif %}
+++4. **Fallback to web search**: ONLY if the search tool returns no relevant results{% if bing_grounding_enabled|default(false) %}, then use the Bing Grounding Tool to search the web for additional information{% else %}, respond that you don't have enough information to answer in the user's language{% endif %}
++ 
++ 5. **Don't invent sources**: Never make up document titles, links, or content. Only use what the search functions return.
++ 
+++6. **NEVER ask the user to choose output options (Option A / B / C).** Always answer the question completely and directly in one response. Do not split the answer across multiple turns.
+++
+++6a. **Current year is 2026.** When the user says "this year", "current year", "FY26", or "FY2026" — always interpret as 2026. **NEVER ask for year clarification.** If the award_years field contains values like "2026" or "FY26", filter by those directly without asking.
+++
+++7. **NEVER offer to generate CSV, Excel, or downloadable files.** You cannot produce files. If data needs to be tabulated, present it as a markdown table directly in the response.
+++
+++8. **Follow-up questions about previously retrieved employee data**: If the user's message refers to a previous answer AND asks about the **whole team** (e.g. "filter that", "show only those with ratings above 4", "give me the full list", "option B"), re-call the SAME filter tool (`search_by_manager` or `search_by_practice_manager`) with the SAME email and appropriate `fields`. BUT if the follow-up names a **specific individual** (e.g. "now show me Adarsh's objectives", "what about John?"), use `search_by_employee` with that person's name + appropriate `fields` — do NOT call `search_by_manager` again.
+++
+++9. **When `search_by_manager` or `search_by_practice_manager` returns "Table with N employee(s) already displayed to the user..."**, the table has already been shown. Ask the user a brief, helpful follow-up question, e.g. "What would you like to do next? I can show details like ratings, objectives, competency, or any other PEP fields for this team."
+++
+++10. **When displaying goals, objectives, or any PEP data for a specific employee**: ALWAYS list EVERY row returned — never skip, omit, or abbreviate rows even if the user uses words like "summarized", "brief", or "overview". "Summarized" means present the data clearly, not that you drop rows. If the employee has 9 objectives, show all 9.
+++
+++11. **Never include source citations, references, or links** in the response (e.g. no `Source: Sheet1 - employee_id: ...`, no `[title](link)` citations). Present only the data itself.
+++
++ ## IMPORTANT: Tool Execution Order
++ You MUST follow this exact order for every question:
++-1. **First**: ALWAYS call `search_knowledge_base` with the user's question
+++1. **First**: Choose the correct tool (see table above) and call it
++ 2. **Second**: Review the results - if no relevant information found{% if bing_grounding_enabled|default(false) %}, call `bing_grounding`{% else %}, inform the user{% endif %}
++ 3. **Third**: Generate response based on retrieved results
++ 
++-⚠️ DO NOT skip step 1 under any circumstances. Even for questions about current events, prices, or real-time data - always check the knowledge base first.
+++⚠️ DO NOT skip step 1 under any circumstances.
++ 
++ ## Response Format
++ 
++ - Provide a clear, concise answer based on the retrieved content
++-- Include inline citations using [title](link) format
++-- If using multiple sources, cite each one appropriately
+++- Do NOT include citations, source links, or document references in the response
++ {% elif bing_grounding_enabled|default(false) %}
++ ## CRITICAL: You MUST use the Bing Grounding Tool
++ 
++diff --git a/src/prompts/single_agent_rag/pep_field_routing.jinja2 b/src/prompts/single_agent_rag/pep_field_routing.jinja2
++new file mode 100644
++index 0000000..f7d2fe0
++--- /dev/null
+++++ b/src/prompts/single_agent_rag/pep_field_routing.jinja2
++@@ -0,0 +1,127 @@
+++### How to set the `fields` parameter
+++
+++Look at the user's question and match it to the patterns below to pick the right `fields` value.
+++
+++---
+++
+++#### Smart defaults (apply these BEFORE selecting fields — never ask the user)
+++
+++| Ambiguity | Default assumption |
+++|---|---|
+++| No year specified | `assessment_year="2026"` (fall back to `"2025"` if all N/A) |
+++| "ratings" without specifying whose | Include BOTH `self_rating` AND `direct_manager_rating` |
+++| "comments" without specifying whose | Include BOTH `self_comments` AND `manager_comments` |
+++| "top performers" without a count | Return top **5** sorted by `band_numeric` desc / `manager_validated_final_kra_score` desc |
+++| "bottom performers" without a count | Return bottom **5** sorted by `band_numeric` asc |
+++| "reportees" without direct/practice qualifier | Use `search_by_manager` (direct reports) |
+++| "performance" / "review" / "appraisal" (vague) | Use fields: `emp_name,category_band,band_numeric,manager_validated_final_kra_score,separation_status` |
+++| "summary" / "overview" for an individual | Use `search_by_employee` with `fields="all"` — **Exception: if the query also mentions "goals", "objectives", or "weightage", use the Goals routing row instead of this default.** |
+++| Employee name is ambiguous (partial match) | Return data for ALL matching employees; let the user pick from results rather than asking "which one?" |
+++
+++---
+++
+++#### Reportee listing & identity
+++
+++| Question pattern | `fields` to use |
+++|---|---|
+++| "list reportees" / "who reports to me" (no specific field) | `emp_name` |
+++| "reportees with their competency / grade" | `emp_name,competency` |
+++| "reportees with their BU / business unit" | `emp_name,BU` |
+++| "reportees with competency and BU" | `emp_name,competency,BU` |
+++| "who joined in [month/quarter/year]" | `emp_name,joined_date,category_band` |
+++| "members promoted last year / recently promoted" | `emp_name,promotion_date,category_band,manager_validated_final_kra_score` |
+++| "resigned / separated employees" | `emp_name,separation_status,category_band` |
+++
+++---
+++
+++#### Performance bands & ranking
+++
+++| Question pattern | `fields` to use |
+++|---|---|
+++| "top and bottom performers" / "rank by band" / "who is EC/SC/CC/IC/NC" / "band distribution" / "predict band distribution" | `emp_name,category_band,band_numeric,manager_validated_final_kra_score,separation_status` |
+++| "list all members rated EC or SC" / "high performers" | `emp_name,category_band,band_numeric,separation_status` |
+++| "list all members rated IC or NC" / "bottom performers" / "at-risk members" | `emp_name,category_band,band_numeric,separation_status` |
+++| "highest KRA score" / "who has the highest score" | `emp_name,category_band,band_numeric,manager_validated_final_kra_score` |
+++| "band distribution for members who joined in Q[N] FY[YY]" | `emp_name,joined_date,category_band,band_numeric,separation_status` |
+++
+++---
+++
+++#### Rating comparisons
+++
+++> ℹ️ `self_rating_avg`, `manager_rating_avg`, `practice_manager_rating_avg`, and `rating_self_mgr_gap` are pre-computed employee-level averages stored in the index (average across all objectives). A positive `rating_self_mgr_gap` means the employee rated themselves higher than the manager. For 2026, `manager_rating_avg` and `rating_self_mgr_gap` will be `\N` if the manager has not yet finalized ratings.
+++
+++| Question pattern | `fields` to use |
+++|---|---|
+++| "self-rating vs manager rating" / "comparison of ratings" / "self vs mgr" / "highlight self-assessment outliers" | `emp_name,self_rating_avg,manager_rating_avg,rating_self_mgr_gap,category_band,manager_validated_final_kra_score` |
+++| "practice manager rating comparison" | `emp_name,self_rating_avg,manager_rating_avg,practice_manager_rating_avg,rating_self_mgr_gap,category_band,manager_validated_final_kra_score` |
+++| "performance summary of all reportees" / "overall ratings for team" | `emp_name,category_band,manager_validated_final_kra_score,self_rating_avg,manager_rating_avg,rating_self_mgr_gap,separation_status` |
+++
+++---
+++
+++#### Goals, objectives & achievement
+++
+++| Question pattern | `fields` to use | `assessment_year` |
+++|---|---|---|
+++| "goals" / "objectives" / "goals with weightage" / "summary of goals" for an **individual** (use `search_by_employee`) | `objective,objective_description,measurement,weightage,self_comments,self_rating,direct_manager_rating,achievement,achievement_percentage,manager_validated_final_kra_score,self_overall_comments,manager_overall_comments,practice_overall_comments` — **NEVER use `fields="all"` for goals queries — always use the explicit field list above.** **Always present ALL fields per objective (measurement, weightage, self_comments, self_rating, direct_manager_rating, achievement, achievement_percentage) — never show only objective name and weightage even if the query says "summary" or "weightage". If a field is null/N/A for an objective, show it explicitly as N/A — never silently omit any field, even empty ones, so the user can see what data is missing. Never ask the user if they want more details, never offer to expand, and never split the response into partial output followed by an offer — present all objectives with all fields in a single complete response.** When reporting `achievement_percentage` for an individual, show the value for EVERY objective row — never just the first row. If a summary is needed, identify the highest value across all rows and call it out explicitly. Show `manager_validated_final_kra_score` as an employee-level summary value (not per-objective) if present in the data. `self_overall_comments`, `manager_overall_comments`, and `practice_overall_comments` are employee-level summary comments — show them as a separate section after the per-objective table. | `"2026"` (Smart default — fall back to `"2025"` if all N/A) |
+++| "goals for all years" / "goals history" / "compare goals across cycles" / "goals in 2024" / "goals in 2025" for an **individual** | Same field list as above | `""` (all years) or the specific year the user named |
+++| "which members exceeded goal thresholds" / "achievement above 100%" | `emp_name,achievement_percentage,category_band` |
+++| "highest achievement %" / "who has highest achievement" | `emp_name,achievement_percentage,category_band,separation_status` — **`achievement_percentage` can exceed 100%; do NOT treat 100% as the maximum or cap.** Always find the true numeric maximum from the data. Values like 110%, 120%, or higher are valid and must be ranked above 100%. |
+++| "goals with highest weightage across the team" | `emp_name,objective,weightage,category_band` |
+++| "achievement ranking" | `emp_name,category_band,band_numeric,achievement_percentage,manager_validated_final_kra_score` |
+++
+++---
+++
+++#### Comments & feedback
+++
+++| Question pattern | `fields` to use |
+++|---|---|
+++| "self-comments" / "self assessment" for an **individual** | `objective,self_comments,self_rating,achievement` |
+++| "manager comments" for an **individual** | `objective,manager_comments,direct_manager_rating,achievement` |
+++| "practice manager comments" for an **individual** | `objective,practice_manager_comments,practice_manager_rating` |
+++| "additional manager comments" / "addl mgr feedback" / "who is the additional manager" for an **individual** | `addl_mgr_emails,addl_mgr_comments,addl_mgr_last_updated` (use `search_by_employee`) — these fields are stored as a flat `=== ADDITIONAL MANAGER FEEDBACK ===` section in the content, **not** in the KPI table. Interpret the result as follows: (1) If the `=== ADDITIONAL MANAGER FEEDBACK ===` section is **absent** from the content — respond: "**[Employee name] does not have an additional manager assigned.**" (2) If the section is present but `addl_mgr_comments` is `\N` or empty — respond: "**[Employee name] has an additional manager assigned ([addl_mgr_emails]) but no comments have been provided yet** (assigned on [addl_mgr_last_updated])." (3) If the section is present and `addl_mgr_comments` has actual text — display the email, comments, and last-updated date. **Never say "I don't have that information" for this query — the absence of the section is itself the answer (no additional manager assigned).** |
+++| "performance pulse" / "check-in feedback" / "check-in summary" / "goalwise check-in" / "meaningful pulse comments" for an **individual** | `checkin_count,checkin_self_overall_comments,mgr_checkin_overall_comments,checkin_self_comments,mgr_checkin_comments,calculated_goal_score,manager_goal_score,checkin_achievement,latest_checkin_status` — **2026 data only**; always use `assessment_year="2026"` and `search_by_employee`. Make exactly **one** tool call with `assessment_year="2026"`. **NEVER retry with `assessment_year="2025"`, `"2024"`, or `""` — check-in fields are structurally absent from pre-2026 data and will always return empty.** When presenting results: **always quote `checkin_self_overall_comments` verbatim as the employee's overall self check-in comment** and **always quote `mgr_checkin_overall_comments` verbatim as the manager's overall check-in comment** — these are employee-level summaries and must be shown prominently even if per-objective `checkin_self_comments`/`mgr_checkin_comments` are empty. If `mgr_checkin_overall_comments` is non-empty, the manager HAS provided feedback — do NOT say "manager has not provided feedback". Only say "manager has not provided check-in feedback" if BOTH `mgr_checkin_overall_comments` AND `mgr_checkin_comments` are empty/null for all rows. **General rule — never exclude a check-in row or field because some of its values are null or empty.** Report every field that has a non-empty value independently. A null manager comment does not mean you skip self-comments, scores, achievement, or status for that objective — show whatever is present and simply omit labels for fields that are truly empty. Never suppress an entire objective row just because one or more fields are missing. |
+++| "consolidated assessment summary" for an **individual** | `objective,self_comments,manager_comments,self_rating,direct_manager_rating,achievement,achievement_percentage,category_band` (use `search_by_employee`, `assessment_year=""` — needs all years for historical context) |
+++| "summarized view" / "full PEP summary" for an **individual** | `objective,objective_description,measurement,weightage,self_comments,manager_comments,self_rating,direct_manager_rating,achievement,achievement_percentage,category_band` (use `search_by_employee`, `assessment_year=""` — all years) |
+++
+++---
+++
+++#### Awards & recognition
+++
+++| Question pattern | `fields` to use |
+++|---|---|
+++| "awards" / "recognition" / "annual award" / "quarterly award" / "insta award" / "distinct contributor" / "appreciation" | `emp_name,award_count,award_types,award_categories,award_years,award_citations,appreciation_count,appreciation_titles,appreciation_messages,appreciation_subcategories` |
+++
+++---
+++
+++#### Historical / multi-year trends
+++
+++> ⚠️ **IMPORTANT for band drop/improvement/trend queries**: These require data from **all years** in a single call. Always use `assessment_year=""` (empty — no filter) so all years are returned together. The system will automatically pre-compute the year-over-year movement — do NOT make separate calls for each year.
+++
+++| Question pattern | `fields` to use | `assessment_year` |
+++|---|---|---|
+++| "ratings dropped" / "band dropped" / "2 band drop" / "dropped 2 bands" | `emp_name,category_band,band_numeric,separation_status` | `""` (all years) |
+++| "ratings improved" / "band improved" / "went up 2 bands" | `emp_name,category_band,band_numeric,separation_status` | `""` (all years) |
+++| "year over year" / "yoy" / "compared to previous year" / "band trend" / "band movement" | `emp_name,category_band,band_numeric,separation_status` | `""` (all years) |
+++| "rating trends over last 3 years" / "FY25, FY24, FY23 bands" | `emp_name,category_band,band_numeric,manager_validated_final_kra_score` | `""` (all years) |
+++| "consistent EC/SC for 3 cycles" | `emp_name,category_band,band_numeric` | `""` (all years) |
+++
+++---
+++
+++#### Large team safeguards
+++
+++- **Team ≥ 50 people** and user asks "full PEP" / "all details" → use `fields="competency,objective,self_comments,self_rating,direct_manager_rating,achievement"` — **NEVER use `fields="all"` for large teams**, it exceeds the 512 KB limit.
+++- **Team < 50 people** and user asks "full PEP" / "all details" → `fields="all"` is acceptable.
+++
+++---
+++
+++#### Band name mapping (always apply when filtering or describing bands)
+++
+++| Short code | Full name |
+++|---|---|
+++| EC | Exceptional Contributor |
+++| SC | Significant Contributor |
+++| CC | Consistent Contributor |
+++| IC | Inconsistent Contributor |
+++| NC | Non-Contributor |
+++
+++When displaying results, always show both the short code and the full name (e.g. **EC – Exceptional Contributor**).
++diff --git a/src/strategies/nl2sql_strategy.py b/src/strategies/nl2sql_strategy.py
++index fbda0dc..deb8f72 100644
++--- a/src/strategies/nl2sql_strategy.py
+++++ b/src/strategies/nl2sql_strategy.py
++@@ -3,6 +3,8 @@ import logging
++ import re
++ from typing import AsyncIterator
++ 
+++logger = logging.getLogger(__name__)
+++
++ from semantic_kernel.agents import (
++     AzureAIAgent,
++     AzureAIAgentSettings,
++@@ -47,11 +49,30 @@ class NL2SQLStrategy(BaseAgentStrategy):
++     async def _load_prompts(self):
++         """Load and cache the three prompt templates once per instance."""
++         if self._triage_prompt is None:
++-            self._triage_prompt      = await self._read_prompt("triage_agent")
++-            self._sqlquery_prompt    = await self._read_prompt("sqlquery_agent")
++-            self._syntetizer_prompt  = await self._read_prompt("syntetizer_agent")
+++            logger.debug("[NL2SQL] Loading prompt templates...")
+++            try:
+++                self._triage_prompt      = await self._read_prompt("triage_agent")
+++                self._sqlquery_prompt    = await self._read_prompt("sqlquery_agent")
+++                self._syntetizer_prompt  = await self._read_prompt("syntetizer_agent")
+++                logger.debug("[NL2SQL] Prompt templates loaded successfully.")
+++            except Exception as e:
+++                logger.error("[NL2SQL] Failed to load prompt templates: %s", e, exc_info=True)
+++                raise
++ 
++     async def initiate_agent_flow(self, user_message: str) -> AsyncIterator[str]:
+++        # Prepend logged-in user context so agents can resolve self-referential queries
+++        # (e.g. "give me my reportees") without requiring the user to type their own email.
+++        principal_name = (self.user_context or {}).get("principal_name", "")
+++        if principal_name and principal_name != "anonymous":
+++            logger.info("[NL2SQL] Injecting logged-in user context for principal: %s", principal_name)
+++            user_message = (
+++                f"[Context: the logged-in user's email is {principal_name}. "
+++                f"When the user refers to 'me', 'my', 'I', or 'myself', use this email as the identity.]\n\n"
+++                f"{user_message}"
+++            )
+++        else:
+++            logger.debug("[NL2SQL] No authenticated principal found; proceeding without user context injection.")
+++
++         # ensure prompts are loaded
++         await self._load_prompts()
++ 
++@@ -61,6 +82,11 @@ class NL2SQLStrategy(BaseAgentStrategy):
++             endpoint=self.project_endpoint
++         )
++ 
+++        logger.info(
+++            "[NL2SQL] Starting agent flow: model=%s endpoint=%s principal=%s",
+++            self.model_name, self.project_endpoint, principal_name or "anonymous",
+++        )
+++
++         # open a single client/session for creation + streaming
++         async with self.credential as creds, \
++                    AzureAIAgent.create_client(
++@@ -69,22 +95,33 @@ class NL2SQLStrategy(BaseAgentStrategy):
++                    ) as client:
++ 
++             # 1) create all three agents in parallel
++-            triage_def, sql_def, syntetizer_def= await asyncio.gather(
++-                client.agents.create_agent(
++-                    model=ai_agent_settings.model_deployment_name,
++-                    name="TriageAgent",
++-                    instructions=self._triage_prompt
++-                ),
++-                client.agents.create_agent(
++-                    model=ai_agent_settings.model_deployment_name,
++-                    name="SQLQueryAgent",
++-                    instructions=self._sqlquery_prompt
++-                ),
++-                client.agents.create_agent(
++-                    model=ai_agent_settings.model_deployment_name,
++-                    name="SyntetizerAgent",
++-                    instructions=self._syntetizer_prompt
++-                ),                
+++            logger.debug("[NL2SQL] Creating TriageAgent, SQLQueryAgent and SyntetizerAgent...")
+++            try:
+++                triage_def, sql_def, syntetizer_def = await asyncio.gather(
+++                    client.agents.create_agent(
+++                        model=ai_agent_settings.model_deployment_name,
+++                        name="TriageAgent",
+++                        instructions=self._triage_prompt
+++                    ),
+++                    client.agents.create_agent(
+++                        model=ai_agent_settings.model_deployment_name,
+++                        name="SQLQueryAgent",
+++                        instructions=self._sqlquery_prompt
+++                    ),
+++                    client.agents.create_agent(
+++                        model=ai_agent_settings.model_deployment_name,
+++                        name="SyntetizerAgent",
+++                        instructions=self._syntetizer_prompt
+++                    ),
+++                )
+++            except Exception as e:
+++                logger.error("[NL2SQL] Failed to create agents: %s", e, exc_info=True)
+++                raise
+++            logger.debug(
+++                "[NL2SQL] Agents created: triage_id=%s sql_id=%s syntetizer_id=%s",
+++                getattr(triage_def, "id", None),
+++                getattr(sql_def, "id", None),
+++                getattr(syntetizer_def, "id", None),
++             )
++ 
++             # 2) wrap them in AzureAIAgent objects (using keyword args!)
++@@ -116,13 +153,19 @@ class NL2SQLStrategy(BaseAgentStrategy):
++ 
++             try:
++                 # start the conversation
+++                logger.debug("[NL2SQL] Adding user message to group chat...")
++                 await chat.add_chat_message(message=user_message)
++ 
++                 buffer = ""
+++                chunk_count = 0
++                 async for content in chat.invoke_stream():
+++                    logger.debug(
+++                        "[NL2SQL] Stream chunk received: agent=%s content_len=%d",
+++                        content.name, len(content.content or ""),
+++                    )
++ 
++                     if content.name == "SyntetizerAgent":
++-
+++                        chunk_count += 1
++                         buffer += content.content
++ 
++                         # only process once the regex matches
++@@ -131,15 +174,23 @@ class NL2SQLStrategy(BaseAgentStrategy):
++ 
++                         # strip the terminator and yield
++                         cleaned = self._terminator_re.sub("", buffer)
+++                        logger.info(
+++                            "[NL2SQL] SyntetizerAgent produced final answer (chunk #%d, len=%d).",
+++                            chunk_count, len(cleaned),
+++                        )
++                         buffer = ""
++                         yield cleaned
++ 
+++            except Exception as e:
+++                logger.error("[NL2SQL] Error during group chat invocation: %s", e, exc_info=True)
+++                raise
++             finally:
++                 # clear conversation state
++                 try:
++                     await chat.reset()
+++                    logger.debug("[NL2SQL] Chat reset completed.")
++                 except Exception as e:
++-                    logging.warning(f"Chat reset failed: {e!r}")
+++                    logger.warning("[NL2SQL] Chat reset failed: %s", e, exc_info=True)
++ 
++                 # schedule background deletions
++                 for agent, name in [
++@@ -149,10 +200,10 @@ class NL2SQLStrategy(BaseAgentStrategy):
++                 ]:
++                     agent_id = getattr(agent, "id", None)
++                     if agent_id:
++-                        logging.info(f"Scheduling deletion for {name} (id={agent_id})")
+++                        logger.info("[NL2SQL] Scheduling deletion for %s (id=%s)", name, agent_id)
++                         self._schedule_agent_deletion(agent_id)
++                     else:
++-                        logging.warning(f"{name} has no id; skipping deletion.")
+++                        logger.warning("[NL2SQL] %s has no id; skipping deletion.", name)
++ 
++     def _schedule_agent_deletion(self, agent_id: str):
++         """
++@@ -167,9 +218,9 @@ class NL2SQLStrategy(BaseAgentStrategy):
++                                endpoint=self.project_endpoint
++                            ) as delete_client:
++                     await delete_client.agents.delete_agent(agent_id)
++-                    logging.info(f"Background deleted agent {agent_id}")
+++                    logger.info("[NL2SQL] Background deleted agent %s", agent_id)
++             except Exception as e:
++-                logging.error(f"Failed background deletion of {agent_id}: {e!r}")
+++                logger.error("[NL2SQL] Failed background deletion of agent %s: %s", agent_id, e, exc_info=True)
++ 
++         task = asyncio.create_task(_delete())
++         task.add_done_callback(lambda t: t.exception())
++diff --git a/src/strategies/single_agent_rag_strategy_v2.py b/src/strategies/single_agent_rag_strategy_v2.py
++index 0537849..10ff729 100644
++--- a/src/strategies/single_agent_rag_strategy_v2.py
+++++ b/src/strategies/single_agent_rag_strategy_v2.py
++@@ -92,7 +92,12 @@ async def prewarm_agents_client() -> None:
++             if aisearch_enabled:
++                 try:
++                     search_client = get_search_client()
++-                    retrieval_tool = FunctionTool(functions={search_client.search_knowledge_base})
+++                    retrieval_tool = FunctionTool(functions={
+++                        search_client.search_knowledge_base,
+++                        search_client.search_by_manager,
+++                        search_client.search_by_practice_manager,
+++                        search_client.search_by_employee,
+++                    })
++                     tools_list.extend(retrieval_tool.definitions)
++                 except Exception as e:
++                     logging.warning("[Startup] Could not add search tool: %s", e)
++@@ -199,6 +204,20 @@ class SingleAgentRAGStrategyV2(BaseAgentStrategy):
++         - If not empty: MAF / Agent V2 streaming with event handlers
++         """
++         flow_start = time.time()
+++
+++        # Inject logged-in user context so the model can resolve self-referential queries
+++        # (e.g. "my reportees", "my manager") without requiring the user to type their email.
+++        # This works for both the direct-LLM and MAF/cached-agent paths.
+++        principal_name = (self.user_context or {}).get("principal_name", "")
+++        if principal_name and principal_name != "anonymous":
+++            logging.info("[Agent Flow V2] Injecting logged-in user context for principal: %s", principal_name)
+++            user_message = (
+++                f"[Context: the logged-in user's email is {principal_name}. "
+++                f"When the user refers to 'me', 'my', 'I', or 'myself', use this email as the identity.]\n\n"
+++                f"{user_message}"
+++            )
+++        else:
+++            logging.debug("[Agent Flow V2] No authenticated principal; proceeding without user context injection.")
++         
++         is_empty = False
++         if self.search_client:
++@@ -276,13 +295,50 @@ class SingleAgentRAGStrategyV2(BaseAgentStrategy):
++             {"role": "assistant", "content": "Assistant generated response directly via stream."}
++         ])
++ 
++-    async def _process_stream(self, agents_client, stream, thread_id):
+++    # Keywords that indicate the user wants analysis/aggregation/filtering rather than a plain list.
+++    _ANALYTICAL_KEYWORDS = {
+++        # Aggregation / ranking
+++        "highest", "lowest", "maximum", "minimum", "max", "min",
+++        "top", "bottom", "most", "least", "average", "avg",
+++        "count", "how many", "which", "who has", "who have",
+++        "best", "worst", "rank", "compare",
+++        "greater than", "less than", "above", "below", "exceed",
+++        "sort", "order by", "percentage", "percent",
+++        # Filtering intent
+++        "filter", "only", "with", "having", "who were", "who was",
+++        "that have", "that has", "that were", "that was",
+++        "promoted", "promotion", "joined", "separated", "active",
+++        "not null", "non-null", "available", "missing", "empty",
+++        # Band / performance category
+++        "ec", "sc", "cc", "ic", "nc",
+++        "exceptional", "significant", "inconsistent", "non-contributor",
+++        "band", "performance band", "performer", "performers",
+++        "distribution", "band distribution",
+++        # Achievement / targets / KRA
+++        "achievement", "achieved", "exceeding", "exceeded", "overachieved",
+++        "on track", "below target", "not entered", "target",
+++        "kra", "score",
+++        # Self vs manager rating
+++        "self rating", "self assessment", "rating gap",
+++        "over-rated", "under-rated", "discrepancy", "aligned",
+++        # Active / separation / attrition
+++        "resigned", "attrition", "current employees", "active only",
+++        # Business unit / competency
+++        "business unit", "bu", "grade", "competency level",
+++    }
+++
+++    async def _process_stream(self, agents_client, stream, thread_id, user_message: str = ""):
++         tool_outputs_to_submit = None
++         run_id_to_submit = None
++         first_token = False
+++        direct_output_yielded = False  # True when filter tool result was streamed directly
+++        _user_msg_lower = user_message.lower()
++         async for event_type, event_data, raw in stream:
++             
++             if event_type == "thread.message.delta":
+++                # Suppress LLM message when we already streamed the formatted table directly
+++                if direct_output_yielded:
+++                    continue
++                 if not first_token:
++                     start_t = getattr(self, '_stream_start_time', time.time())
++                     logging.info(f"[Agent Flow V2] 🤖 MAF First Token: {time.time() - start_t:.2f}s")
++@@ -320,18 +376,87 @@ class SingleAgentRAGStrategyV2(BaseAgentStrategy):
++                 
++                 tool_calls = event_data.required_action.submit_tool_outputs.tool_calls
++                 tool_outputs = []
+++                _retrieval_tools = {"search_knowledge_base", "search_by_manager", "search_by_practice_manager", "search_by_employee"}
+++                _filter_tools = {"search_by_manager", "search_by_practice_manager"}
++                 for tc in tool_calls:
++-                    if tc.function.name == "search_knowledge_base" and self.search_client:
+++                    if tc.function.name in _retrieval_tools and self.search_client:
++                         try:
++                             args = json.loads(tc.function.arguments)
++                             t0 = time.time()
++-                            result = await self.search_client.search_knowledge_base(**args)
+++                            fn = getattr(self.search_client, tc.function.name)
+++                            result = await fn(**args)
++                             result_str = result if isinstance(result, str) else json.dumps(result)
++-                            logging.info(f"[Agent Flow V2] Retrieval tool executed in {time.time()-t0:.2f}s")
++-                            tool_outputs.append({
++-                                "tool_call_id": tc.id,
++-                                "output": result_str
++-                            })
+++                            logging.info(f"[Agent Flow V2] {tc.function.name} executed in {time.time()-t0:.2f}s")
+++
+++                            if tc.function.name in _filter_tools:
+++                                # Detect empty result — skip direct-format path so LLM generates a natural no-results response
+++                                try:
+++                                    _parsed_result = json.loads(result_str)
+++                                    _is_empty_result = isinstance(_parsed_result, list) and len(_parsed_result) == 0
+++                                except Exception:
+++                                    _is_empty_result = False
+++
+++                                # Detect analytical intent — let LLM process data instead of streaming table directly
+++                                # If only emp_name is requested, it's never analytical — force direct-stream path
+++                                _fields_arg = args.get("fields", "emp_name").strip().lower()
+++                                _names_only = _fields_arg in ("emp_name", "")
+++                                _is_analytical = (not _names_only) and any(kw in _user_msg_lower for kw in self._ANALYTICAL_KEYWORDS)
+++
+++                                if _is_empty_result:
+++                                    logging.info(f"[Agent Flow V2] {tc.function.name} returned 0 results; letting LLM generate no-results response")
+++                                    tool_outputs.append({
+++                                        "tool_call_id": tc.id,
+++                                        "output": "No employees were found for this query."
+++                                    })
+++                                elif _is_analytical:
+++                                    # Analytical query — send raw JSON to LLM so it can aggregate/filter/rank
+++                                    logging.info(f"[Agent Flow V2] {tc.function.name} analytical query detected; forwarding data to LLM for analysis")
+++                                    max_bytes = 470_000
+++                                    if len(result_str.encode("utf-8")) > max_bytes:
+++                                        result_str = result_str.encode("utf-8")[:max_bytes].decode("utf-8", errors="ignore")
+++                                        logging.warning(f"[Agent Flow V2] {tc.function.name} analytical output truncated to 470KB")
+++                                    tool_outputs.append({
+++                                        "tool_call_id": tc.id,
+++                                        "output": result_str
+++                                    })
+++                                else:
+++                                    # Display-all query — format and stream the table directly, bypass LLM entirely
+++                                    _employee_count = len(_parsed_result) if isinstance(_parsed_result, list) else "some"
+++                                    try:
+++                                        # Build contextual intro based on tool and fields requested
+++                                        if _names_only:
+++                                            _fields_label = None
+++                                        else:
+++                                            _fields_label = _fields_arg.replace(",", ", ")
+++                                        if tc.function.name == "search_by_practice_manager":
+++                                            _intro = "Here are the employees in your practice team"
+++                                        else:
+++                                            _intro = "Here are the employees reporting to you"
+++                                        if _fields_label:
+++                                            _intro += f", along with their {_fields_label}"
+++                                        _intro += ":\n\n"
+++
+++                                        formatted = self.search_client._format_filter_result(result_str)
+++                                        logging.info(f"[Agent Flow V2] {tc.function.name} direct output: {len(formatted)} chars")
+++                                        yield _intro + formatted
+++                                        direct_output_yielded = True
+++                                    except Exception as fmt_err:
+++                                        logging.warning(f"[Agent Flow V2] _format_filter_result failed ({fmt_err}); falling back to LLM")
+++                                    # Submit stub: LLM only needs to add a short follow-up question
+++                                    tool_outputs.append({
+++                                        "tool_call_id": tc.id,
+++                                        "output": f"Table with {_employee_count} employee(s) already displayed to the user. Add one short helpful follow-up question (e.g. ask if they want ratings, band, objectives, or competency for this team)."
+++                                    })
+++                            else:
+++                                # search_knowledge_base: send full result to LLM as before
+++                                max_bytes = 470_000
+++                                if len(result_str.encode("utf-8")) > max_bytes:
+++                                    result_str = result_str.encode("utf-8")[:max_bytes].decode("utf-8", errors="ignore")
+++                                    logging.warning(f"[Agent Flow V2] {tc.function.name} output truncated to 470KB (512KB API limit)")
+++                                tool_outputs.append({
+++                                    "tool_call_id": tc.id,
+++                                    "output": result_str
+++                                })
++                         except Exception as e:
++                             logging.error(f"Error executing tool {tc.function.name}: {e}")
++                             tool_outputs.append({
++@@ -382,7 +507,7 @@ class SingleAgentRAGStrategyV2(BaseAgentStrategy):
++             stream2 = AsyncAgentRunStream(response_iterator, agents_client.runs._handle_submit_tool_outputs, event_handler)
++             
++             async with stream2 as s2:
++-                async for chunk in self._process_stream(agents_client, s2, thread_id):
+++                async for chunk in self._process_stream(agents_client, s2, thread_id, user_message=user_message):
++                     yield chunk
++ 
++     async def _stream_maf_agent(self, user_message: str):
++@@ -417,8 +542,13 @@ class SingleAgentRAGStrategyV2(BaseAgentStrategy):
++             # OBO prep
++             allow_anonymous = self.cfg.get("ALLOW_ANONYMOUS", default=True, type=bool)
++             request_access_token = getattr(self, "request_access_token", None)
+++            principal_email = (self.user_context or {}).get("principal_name", "") or None
++             try:
++-                self.search_client.set_request_context(api_access_token=request_access_token, allow_anonymous=allow_anonymous)
+++                self.search_client.set_request_context(
+++                    api_access_token=request_access_token,
+++                    allow_anonymous=allow_anonymous,
+++                    principal_email=principal_email,
+++                )
++             except Exception:
++                 pass
++ 
++@@ -484,13 +614,49 @@ class SingleAgentRAGStrategyV2(BaseAgentStrategy):
++         self._stream_start_time = stream_start
++         t_stream = time.time()
++ 
+++        # Build per-run additional_instructions to inject the logged-in user's identity.
+++        # This is more reliable than a [Context: ...] message prefix because it goes
+++        # directly into the system context for this specific run, even when using a
+++        # pre-warmed / cached agent whose static instructions don't know who is logged in.
+++        _principal_name = (self.user_context or {}).get("principal_name", "")
+++        if _principal_name and _principal_name != "anonymous":
+++            _additional_instructions = (
+++                f"IMPORTANT: The currently authenticated user's email is {_principal_name}. "
+++                f"Whenever the user uses words like 'me', 'my', 'I', or 'myself' to refer to themselves "
+++                f"(e.g. 'my reportees', 'my manager', 'my team', 'who reports to me'), "
+++                f"you MUST use {_principal_name} as their identity in all tool call arguments. "
+++                f"For example, if asked for 'my reportees', call search_by_manager with "
+++                f"manager_email=\"{_principal_name}\".\n\n"
+++                f"SECURITY RESTRICTION: You are only permitted to retrieve reportee or team data for "
+++                f"the logged-in user ({_principal_name}). "
+++                f"If the user asks about another person's reportees or team (e.g. 'who reports to other@company.com'), "
+++                f"do NOT call any search tool. Instead respond: "
+++                f"'I can only retrieve reportee information for your own account. "
+++                f"I'm not able to look up another person\\'s team.'"
+++            )
+++            logging.info(
+++                "[Agent Flow V2] Injecting user identity via additional_instructions: %s",
+++                _principal_name,
+++            )
+++        else:
+++            _additional_instructions = None
+++            logging.warning(
+++                "[Agent Flow V2] principal_name is '%s' — user identity will NOT be injected. "
+++                "Self-referential queries (e.g. 'my reportees') cannot be resolved. "
+++                "Ensure the UI sends a Bearer token and OAUTH_AZURE_AD_TENANT_ID / "
+++                "OAUTH_AZURE_AD_CLIENT_ID are configured.",
+++                _principal_name or "empty",
+++            )
+++
++         try:
++             # MAF Feature: Native Real-time event streaming
++             async with await agents_client.runs.stream(
++                 thread_id=thread.id,
++-                agent_id=agent.id
+++                agent_id=agent.id,
+++                additional_instructions=_additional_instructions,
+++                max_completion_tokens=16000,
++             ) as stream:
++-                async for chunk in self._process_stream(agents_client, stream, thread.id):
+++                async for chunk in self._process_stream(agents_client, stream, thread.id, user_message=user_message):
++                     yield chunk
++ 
++         except Exception as e:
+diff --git a/src/connectors/search.py b/src/connectors/search.py
+index 6a21917..2317b60 100644
+--- a/src/connectors/search.py
++++ b/src/connectors/search.py
+@@ -1,3 +1,4 @@
++import re
+ import aiohttp
+ import logging
+ import json
+@@ -90,11 +91,13 @@ class SearchClient:
+             self._session = aiohttp.ClientSession()
+         return self._session
+ 
+-    def set_request_context(self, *, api_access_token: Optional[str], allow_anonymous: bool) -> None:
++    def set_request_context(self, *, api_access_token: Optional[str], allow_anonymous: bool, principal_email: Optional[str] = None) -> None:
+         """Sets per-request context used for permission trimming.
+ 
+         api_access_token is the incoming user token sent to the orchestrator (audience: this API).
+         It is used as the OBO assertion to acquire a Search-audience user token.
++        principal_email is the logged-in user's email, used to enforce manager/practice_manager
++        email restrictions so users can only query their own team.
+         """
+         api_access_token = (api_access_token or "").strip() or None
+         if api_access_token != self._request_api_access_token:
+@@ -104,6 +107,7 @@ class SearchClient:
+ 
+         self._request_api_access_token = api_access_token
+         self._allow_anonymous = bool(allow_anonymous)
++        self._principal_email = (principal_email or "").strip().lower() or None
+ 
+     def _token_fingerprint(self, token: Optional[str]) -> str:
+         if not token:
+@@ -426,7 +430,7 @@ class SearchClient:
+             
+             # Build search body according to search approach
+             search_body: Dict[str, Any] = {
+-                "select": "title,content,url,filepath,chunk_id",
++                "select": "title,content,url,filepath,chunk_id,manager_email,manager_name,practice_manager_email,practice_manager_name",
+                 "top": self.search_top_k
+             }
+             
+@@ -510,6 +514,495 @@ class SearchClient:
+             logging.warning("[Retrieval] Falling back to empty results (ALLOW_ANONYMOUS=true)")
+             return json.dumps({"results": [], "query": query, "error": "search_failed"})
+ 
++    # ------------------------------------------------------------------
++    # Paginated filter fetch: issues repeated search POSTs using `skip`
++    # until all matching chunks are retrieved.  Required for datasets
++    # larger than the Azure AI Search per-request ceiling of 1 000 rows.
++    # A safety ceiling of 50 000 total rows prevents runaway loops on
++    # very large indexes.
++    # ------------------------------------------------------------------
++    async def _fetch_all_by_filter(
++        self,
++        select_fields: str,
++        filter_expr: str,
++        *,
++        page_size: int = 1000,
++        max_results: int = 50_000,
++        search_user_token: Optional[str] = None,
++    ) -> list:
++        """
++        Fetches every document matching `filter_expr` from the index by
++        issuing paginated search requests (skip/top) until no more pages
++        are returned.  Returns a flat list of raw document dicts.
++        """
++        all_docs: list = []
++        skip = 0
++        while True:
++            body: Dict[str, Any] = {
++                "search": "*",
++                "select": select_fields,
++                "filter": filter_expr,
++                "top": page_size,
++                "skip": skip,
++            }
++            response = await self.search(
++                index_name=self.index_name,
++                body=body,
++                search_user_token=search_user_token,
++            )
++            page = response.get("value", [])
++            all_docs.extend(page)
++            logging.info(
++                "[_fetch_all_by_filter] page skip=%d returned %d row(s); total so far=%d",
++                skip, len(page), len(all_docs),
++            )
++            if len(page) < page_size:
++                break  # last page
++            skip += page_size
++            if skip >= max_results:
++                logging.warning(
++                    "[_fetch_all_by_filter] Safety ceiling reached at %d results — stopping pagination",
++                    len(all_docs),
++                )
++                break
++        return all_docs
++
++    # ------------------------------------------------------------------
++    # Helper: group multi-chunk results by employee to avoid duplicate
++    # entries and stay well under the 512 KB Azure AI Foundry tool-output
++    # limit.  All PEP fields (objectives, self_comments, competency, …)
++    # live in the `content` column (a GitHub markdown table).
++    # ------------------------------------------------------------------
++
++    @staticmethod
++    def _extract_fields_from_table(content: str, fields: List[str]) -> str:
++        """
++        Parses a GitHub-flavored markdown table (tabulate tablefmt='github')
++        and returns only the requested columns as compact 'col: val' lines.
++
++        Matching is case-, space-, and underscore-insensitive so e.g.
++        'self comments' matches the 'self_comments' column.
++        emp_name and employee_email are always included for identification.
++        """
++        def _norm(s: str) -> str:
++            return re.sub(r'[\s_\-]+', '', s.lower().strip())
++
++        # Only pick lines that are proper markdown table rows (start with |).
++        # This skips the structured-content EMPLOYEE SUMMARY line which uses
++        # "key: value | key: value" format (no leading |) but contains | chars.
++        table_lines = [l for l in content.splitlines() if l.strip().startswith('|')]
++        if len(table_lines) < 3:
++            return content[:2000]
++
++        # First table line = headers
++        raw_headers = [h.strip() for h in table_lines[0].strip(' |').split('|')]
++        norm_headers = [_norm(h) for h in raw_headers]
++
++        # Always include identifier columns (emp_name only — not employee_email)
++        id_norms = {'empname', 'employeeid'}
++        target_norms = {_norm(f) for f in fields if f.strip()} | id_norms
++
++        # Find matching column indices (exact match after normalisation only)
++        col_indices: List[int] = []
++        col_names: List[str] = []
++        for i, nh in enumerate(norm_headers):
++            if not nh:
++                continue
++            if any(tf and tf == nh for tf in target_norms):
++                if i not in col_indices:
++                    col_indices.append(i)
++                    col_names.append(raw_headers[i])
++
++        if not col_indices:
++            return content[:2000]
++
++        result_rows: List[str] = []
++        for line in table_lines[1:]:
++            cells = [c.strip() for c in line.strip(' |').split('|')]
++            # Skip separator line (cells are '---' or similar)
++            if cells and all(not c.replace('-', '').replace(' ', '') for c in cells if c):
++                continue
++            row_parts = []
++            for idx, col_name in zip(col_indices, col_names):
++                val = cells[idx].strip() if idx < len(cells) else ''
++                # Always emit the field, even if empty, so the LLM sees N/A
++                row_parts.append(f'{col_name}: {val if val else "N/A"}')
++            if row_parts:
++                result_rows.append(' | '.join(row_parts))
++
++        return '\n'.join(result_rows) if result_rows else content[:2000]
++
++    @staticmethod
++    def _merge_results_by_employee(
++        raw_results: list,
++        *,
++        fields: Optional[List[str]] = None,
++        total_budget_chars: int = 430_000,  # 430 KB leaves ~40 KB for JSON wrapper overhead
++        max_per_employee_chars: int = 15_000,
++    ) -> list:
++        """
++        Groups all index chunks for the same employee into one SearchResult.
++
++        When `fields` is provided (e.g. ["competency", "objective"]), only
++        those columns are extracted from the markdown table, producing
++        compact output that fits even 500+ employees in the 512 KB limit:
++          - "competency" for 500 employees  ->  ~20 KB total
++          - "competency,objective" for 500  ->  ~100 KB total
++
++        When `fields` is None ("all"), the full content is returned subject
++        to the dynamic per-employee budget (470 KB / N employees):
++          - 36  employees  ->  ~13 000 chars each  (470 KB total)
++          - 200 employees  ->   ~2 350 chars each  (470 KB total)
++          - 500 employees  ->     ~940 chars each  (470 KB total)
++        """
++        from collections import OrderedDict
++        use_all = not fields  # None means return all fields
++
++        grouped: "OrderedDict[str, dict]" = OrderedDict()
++        for doc in raw_results:
++            key = (doc.get("emp_name") or "").strip() or doc.get("title", "unknown")
++            chunk_content = (doc.get("content") or "").strip()
++            if key not in grouped:
++                grouped[key] = {
++                    "emp_name": key,
++                    "title": doc.get("title", ""),
++                    "link": doc.get("filepath") or doc.get("url", ""),
++                    "content_parts": [],
++                }
++            if chunk_content:
++                grouped[key]["content_parts"].append(chunk_content)
++
++        n = max(1, len(grouped))
++        cap = max(300, min(max_per_employee_chars, total_budget_chars // n))
++        logging.info(
++            "[_merge_results_by_employee] %d employee(s) — fields=%s — per-employee cap: %d chars",
++            n,
++            "all" if use_all else ",".join(fields),
++            cap,
++        )
++
++        merged_list = []
++        for emp_name, data in grouped.items():
++            if use_all:
++                merged_content = "\n---\n".join(data["content_parts"])
++            else:
++                # Extract only requested fields from each content chunk
++                extracted = [
++                    SearchClient._extract_fields_from_table(part, fields)
++                    for part in data["content_parts"]
++                ]
++                merged_content = "\n".join(p for p in extracted if p)
++
++            if len(merged_content) > cap:
++                merged_content = merged_content[:cap] + "…[truncated]"
++            merged_list.append(
++                SearchResult(
++                    title=data["title"],
++                    link=data["link"],
++                    content=f"Employee: {emp_name}\n{merged_content}" if merged_content else f"Employee: {emp_name}",
++                ).model_dump()
++            )
++        return merged_list
++
++
++    @staticmethod
++    def _format_filter_result(result_json_str: str) -> str:
++        """
++        Parses JSON returned by search_by_manager / search_by_practice_manager and
++        builds a markdown table directly in Python. Called by the strategy to stream
++        the table to the UI without routing through the LLM.
++        """
++        try:
++            employees = json.loads(result_json_str)
++        except Exception:
++            return result_json_str
++
++        if not isinstance(employees, list) or not employees:
++            return result_json_str
++
++        rows: list = []
++        all_cols: list = []  # column order from first employee seen
++
++        for item in employees:
++            content = item.get("content", "")
++            emp_name = ""
++            fields: dict = {}
++            for line in content.splitlines():
++                line = line.strip()
++                if not line:
++                    continue
++                if line.startswith("Employee:"):
++                    emp_name = line.replace("Employee:", "").strip()
++                    continue
++                for pair in line.split(" | "):
++                    pair = pair.strip()
++                    if ":" not in pair:
++                        continue
++                    k, _, v = pair.partition(":")
++                    k, v = k.strip(), v.strip() or "N/A"
++                    norm = re.sub(r'[\s_\-]+', '', k.lower())
++                    if k and norm not in ("empname", "employeeid"):
++                        if k not in fields:
++                            fields[k] = v
++                        if k not in all_cols:
++                            all_cols.append(k)
++            if not emp_name:
++                emp_name = item.get("emp_name", "Unknown")
++            rows.append((emp_name, fields))
++
++        if not rows:
++            return result_json_str
++
++        # Defensive: drop any blank/whitespace-only column names that may have slipped through
++        all_cols = [c for c in all_cols if c.strip()]
++
++        count = len(rows)
++        if not all_cols:
++            # Names-only: plain numbered list (no table, no pipes)
++            list_rows = [f"{i}. {emp}" for i, (emp, _) in enumerate(rows, 1)]
++            return f"Found **{count}** employees.\n\n" + "\n".join(list_rows)
++        else:
++            header = "| Employee Name | " + " | ".join(all_cols) + " |"
++            separator = "|---|" + "|".join(["---"] * len(all_cols)) + "|"
++            data_rows = [
++                "| " + emp + " | " + " | ".join(flds.get(c, "N/A") for c in all_cols) + " |"
++                for emp, flds in rows
++            ]
++            return f"Found **{count}** employees.\n\n" + "\n".join([header, separator] + data_rows)
++
++    async def search_by_employee(self, employee_name: str, fields: str = "all", assessment_year: str = "") -> str:
++        """
++        Returns PEP data for a specific employee looked up by name.
++        Uses $filter with search.ismatch so the lookup is case-insensitive and
++        does not depend on vector relevance scoring.
++
++        Use this when the user asks about ONE specific person by name
++        (e.g. "goals for Adarsh A", "Adarsh's ratings", "show competency of John").
++
++        :param employee_name: The employee's name (or partial name) as the user typed it.
++        :param fields: Comma-separated PEP column names to return.
++            Examples: "objective,objective_description" for goals/weightage,
++            "competency", "self_rating,direct_manager_rating,achievement",
++            "self_comments,manager_comments".
++            Use "all" to get full PEP.
++            Common fields: competency, BU, objective, objective_description,
++            self_comments, manager_comments, practice_manager_comments,
++            self_rating, direct_manager_rating, practice_manager_rating,
++            achievement, achievement_percentage, category_band, promotion_date,
++            joined_date, separation_status.
++        :param assessment_year: Filter to a specific PEP cycle year, e.g. "2026" or "2025".
++            Pass an empty string (default) to return data across ALL years — use this
++            for historical/trend queries or consolidated summaries spanning multiple cycles.
++        :return: JSON string with one merged entry per matched employee.
++        """
++        logging.info("[Retrieval] search_by_employee: employee_name=%s fields=%s assessment_year=%s", employee_name, fields, assessment_year)
++
++        # Sanitise: escape single-quotes to prevent OData injection
++        safe_name = employee_name.strip().replace("'", "''")
++        field_list = None if fields.strip().lower() == "all" else [
++            f.strip() for f in fields.split(",") if f.strip()
++        ]
++
++        # Security: restrict results to employees who report to the logged-in user
++        # (either as direct manager or practice manager). This prevents any user
++        # from querying PEP data for employees outside their reportee chain.
++        principal = getattr(self, "_principal_email", None)
++        if principal:
++            safe_principal = principal.strip().lower().replace("'", "''")
++            manager_guard = (
++                f" and (manager_email eq '{safe_principal}'"
++                f" or practice_manager_email eq '{safe_principal}')"
++            )
++        else:
++            manager_guard = ""
++
++        # Optional year filter — scopes query to a single PEP cycle
++        year = assessment_year.strip()
++        year_filter = f" and assessment_year eq '{year.replace(chr(39), chr(39)*2)}'" if year else ""
++
++        # Use search.ismatch with phrase search ("...") for case-insensitive exact phrase match
++        # on the emp_name field. This works even when emp_name uses a language analyzer.
++        safe_phrase = safe_name.replace('"', '\\"')
++        filter_expr = f'search.ismatch(\'"{safe_phrase}"\', \'emp_name\'){manager_guard}{year_filter}'
++
++        try:
++            search_user_token = await self._get_search_user_token_for_trimming()
++            raw = await self._fetch_all_by_filter(
++                select_fields="title,url,filepath,chunk_id,emp_name,manager_email,manager_name,practice_manager_email,practice_manager_name,content",
++                filter_expr=filter_expr,
++                search_user_token=search_user_token,
++            )
++
++            if not raw:
++                # Fallback: try startswith-style match using search.ismatch without phrase quotes
++                logging.info("[Retrieval] search_by_employee: phrase match returned 0 rows; retrying with token match")
++                filter_expr_loose = f"search.ismatch('{safe_name}', 'emp_name'){manager_guard}{year_filter}"
++                raw = await self._fetch_all_by_filter(
++                    select_fields="title,url,filepath,chunk_id,emp_name,manager_email,manager_name,practice_manager_email,practice_manager_name,content",
++                    filter_expr=filter_expr_loose,
++                    search_user_token=search_user_token,
++                )
++
++            # Single-employee query: give the full 430KB budget to one person
++            # so all objective rows fit (each row ~2-3KB, 9 rows = ~20KB).
++            results_list = self._merge_results_by_employee(
++                raw, fields=field_list, max_per_employee_chars=430_000
++            )
++            n = len(results_list)
++            logging.info(
++                "[Retrieval] search_by_employee: %d raw chunk(s) merged into %d employee(s) for name '%s' (fields=%s)",
++                len(raw), n, employee_name, fields,
++            )
++
++            # If no results and a manager guard was applied, return a clear
++            # authorization error so the LLM can tell the user the right thing.
++            if n == 0 and manager_guard:
++                logging.warning(
++                    "[Retrieval] search_by_employee: 0 results with manager guard active — '%s' is not a reportee of '%s'",
++                    employee_name, principal,
++                )
++                return json.dumps({
++                    "error": "not_authorized",
++                    "message": f"'{employee_name}' is not found in your reportee chain. You can only access PEP data for your direct or practice reportees.",
++                })
++
++            return json.dumps(results_list)
++
++        except Exception as e:
++            logging.error("[Retrieval] search_by_employee failed: %s", e, exc_info=True)
++            return json.dumps({"error": str(e), "employee_name": employee_name})
++
++    async def search_by_manager(self, manager_email: str, fields: str = "all", assessment_year: str = "") -> str:
++        """
++        Returns ALL employees whose manager_email matches exactly.
++        Uses $filter so no employee is missed regardless of relevance score.
++
++        Use this whenever the user asks about a manager's reportees, direct
++        reports, team members, or any employee-level PEP field for that team.
++
++        :param manager_email: The manager's exact email address.
++        :param fields: Comma-separated PEP column names to return per employee.
++            Extract the field names the user is asking about from their question.
++            Examples: "competency", "competency,BU", "objective,self_comments",
++            "self_rating,direct_manager_rating,achievement".
++            If the user just wants a list of names, use "emp_name".
++            Use "all" only for small teams (fewer than 50 people).
++            Common fields: competency, BU, objective, objective_description,
++            self_comments, manager_comments, practice_manager_comments,
++            self_rating, direct_manager_rating, achievement,
++            achievement_percentage, category_band, promotion_date.
++        :param assessment_year: Filter to a specific PEP cycle year, e.g. "2026" or "2025".
++            Pass an empty string (default) to return data across ALL years — use this
++            for historical/trend queries or consolidated summaries spanning multiple cycles.
++        :return: JSON string with one merged entry per employee.
++        """
++        logging.info("[Retrieval] search_by_manager: manager_email=%s fields=%s assessment_year=%s", manager_email, fields, assessment_year)
++
++        # Security: enforce that users can only query their own reportees.
++        # If the logged-in user's email is known, ignore whatever email the LLM
++        # passed and always use the principal's email instead.
++        principal = getattr(self, "_principal_email", None)
++        if principal:
++            if manager_email.strip().lower() != principal:
++                logging.warning(
++                    "[Retrieval] search_by_manager: LLM requested email '%s' but principal is '%s'; overriding.",
++                    manager_email, principal,
++                )
++            manager_email = principal
++
++        # Sanitise to prevent OData injection
++        safe_email = manager_email.strip().lower().replace("'", "''")
++        field_list = None if fields.strip().lower() == "all" else [
++            f.strip() for f in fields.split(",") if f.strip()
++        ]
++
++        # Optional year filter
++        year = assessment_year.strip()
++        year_filter = f" and assessment_year eq '{year.replace(chr(39), chr(39)*2)}'" if year else ""
++
++        try:
++            search_user_token = await self._get_search_user_token_for_trimming()
++            raw = await self._fetch_all_by_filter(
++                select_fields="title,url,filepath,chunk_id,emp_name,manager_email,manager_name,content",
++                filter_expr=f"manager_email eq '{safe_email}'{year_filter}",
++                search_user_token=search_user_token,
++            )
++
++            results_list = self._merge_results_by_employee(raw, fields=field_list)
++            n = len(results_list)
++            logging.info(
++                "[Retrieval] search_by_manager: %d raw chunk(s) merged into %d employee(s) for manager '%s' (fields=%s, year=%s)",
++                len(raw), n, manager_email, fields, year or "all",
++            )
++            return json.dumps(results_list)
++
++        except Exception as e:
++            logging.error("[Retrieval] search_by_manager failed: %s", e, exc_info=True)
++            return json.dumps({"error": str(e), "manager_email": manager_email})
++
++    async def search_by_practice_manager(self, practice_manager_email: str, fields: str = "all", assessment_year: str = "") -> str:
++        """
++        Returns ALL employees whose practice_manager_email matches exactly.
++        Uses $filter so no employee is missed regardless of relevance score.
++
++        Use this for dotted-line / practice manager reportee queries, or when
++        the user asks about any employee-level PEP field for that practice team.
++
++        :param practice_manager_email: The practice manager's exact email address.
++        :param fields: Comma-separated PEP column names to return per employee.
++            Extract the field names the user is asking about from their question.
++            Examples: "competency", "competency,BU", "objective,self_comments",
++            "self_rating,direct_manager_rating,achievement".
++            If the user just wants a list of names, use "emp_name".
++            Use "all" only for small teams (fewer than 50 people).
++            Common fields: competency, BU, objective, objective_description,
++            self_comments, manager_comments, practice_manager_comments,
++            self_rating, direct_manager_rating, achievement,
++            achievement_percentage, category_band, promotion_date.
++        :param assessment_year: Filter to a specific PEP cycle year, e.g. "2026" or "2025".
++            Pass an empty string (default) to return data across ALL years.
++        :return: JSON string with one merged entry per employee.
++        """
++        logging.info("[Retrieval] search_by_practice_manager: practice_manager_email=%s fields=%s assessment_year=%s", practice_manager_email, fields, assessment_year)
++
++        # Security: enforce that users can only query their own practice team.
++        principal = getattr(self, "_principal_email", None)
++        if principal:
++            if practice_manager_email.strip().lower() != principal:
++                logging.warning(
++                    "[Retrieval] search_by_practice_manager: LLM requested email '%s' but principal is '%s'; overriding.",
++                    practice_manager_email, principal,
++                )
++            practice_manager_email = principal
++
++        safe_email = practice_manager_email.strip().lower().replace("'", "''")
++        field_list = None if fields.strip().lower() == "all" else [
++            f.strip() for f in fields.split(",") if f.strip()
++        ]
++
++        # Optional year filter
++        year = assessment_year.strip()
++        year_filter = f" and assessment_year eq '{year.replace(chr(39), chr(39)*2)}'" if year else ""
++
++        try:
++            search_user_token = await self._get_search_user_token_for_trimming()
++            raw = await self._fetch_all_by_filter(
++                select_fields="title,url,filepath,chunk_id,emp_name,manager_email,manager_name,practice_manager_email,practice_manager_name,content",
++                filter_expr=f"practice_manager_email eq '{safe_email}'{year_filter}",
++                search_user_token=search_user_token,
++            )
++
++            results_list = self._merge_results_by_employee(raw, fields=field_list)
++            n = len(results_list)
++            logging.info(
++                "[Retrieval] search_by_practice_manager: %d raw chunk(s) merged into %d employee(s) for practice manager '%s' (fields=%s, year=%s)",
++                len(raw), n, practice_manager_email, fields, year or "all",
++            )
++            return json.dumps(results_list)
++
++        except Exception as e:
++            logging.error("[Retrieval] search_by_practice_manager failed: %s", e, exc_info=True)
++            return json.dumps({"error": str(e), "practice_manager_email": practice_manager_email})
+ 
+     async def fetch_filepath_from_index(self, document_id: str) -> Optional[str]:
+         """
+diff --git a/src/plugins/retrieval/plugin.py b/src/plugins/retrieval/plugin.py
+index a41d70e..53ec4fa 100644
+--- a/src/plugins/retrieval/plugin.py
++++ b/src/plugins/retrieval/plugin.py
+@@ -75,7 +75,7 @@ class RetrievalPlugin:
+             azure_search_token = await self._get_azure_search_token()
+ 
+             body: Dict[str, Any] = {
+-                "select": "title, content, url, filepath, chunk_id",
++                "select": "title, content, url, filepath, chunk_id, manager_email, manager_name, practice_manager_email, practice_manager_name",
+                 "top": self.search_top_k
+             }
+             if self.search_approach == "term":
+@@ -127,6 +127,78 @@ class RetrievalPlugin:
+         sources = ' '.join(search_results)
+         return VectorIndexRetrievalResult(result=sources, error=error_message)
+ 
++    @kernel_function(
++        name="RetrieveByManagerEmail",
++        description=(
++            "Returns ALL employees that report to a specific manager. "
++            "Use this whenever the user asks about a manager's reportees, "
++            "direct reports, or team members. "
++            "Pass the manager's exact email address as manager_email."
++        )
++    )
++    async def retrieve_by_manager_email(
++        self,
++        manager_email: Annotated[str, "The exact email address of the manager whose reportees should be listed"],
++    ) -> VectorIndexRetrievalResult:
++        search_results: List[str] = []
++        error_message: Optional[str] = None
++        try:
++            from connectors import get_search_client
++            search_client = get_search_client()
++            raw = await search_client.search_by_manager(manager_email)
++            import json as _json
++            data = _json.loads(raw)
++            for doc in data.get("results", []):
++                content_str = doc.get("content", "").strip()
++                link = doc.get("link", "")
++                search_results.append(f"{link}: {content_str}\n")
++            logging.info(
++                f"[retrieve_by_manager_email] Returned {len(search_results)} employee(s) "
++                f"for manager '{manager_email}'"
++            )
++        except Exception as e:
++            error_message = f"Exception occurred: {e}"
++            logging.error(f"[retrieve_by_manager_email] {error_message}", exc_info=True)
++
++        sources = " ".join(search_results)
++        return VectorIndexRetrievalResult(result=sources, error=error_message)
++
++    @kernel_function(
++        name="RetrieveByPracticeManagerEmail",
++        description=(
++            "Returns ALL employees whose practice manager (dotted-line manager) is the given person. "
++            "Use this when the user asks about a practice manager's reportees, dotted-line reports, "
++            "or practice team members. "
++            "Pass the practice manager's exact email address as practice_manager_email."
++        )
++    )
++    async def retrieve_by_practice_manager_email(
++        self,
++        practice_manager_email: Annotated[str, "The exact email address of the practice manager whose dotted-line reportees should be listed"],
++    ) -> VectorIndexRetrievalResult:
++        search_results: List[str] = []
++        error_message: Optional[str] = None
++        try:
++            from connectors import get_search_client
++            search_client = get_search_client()
++            raw = await search_client.search_by_practice_manager(practice_manager_email)
++            import json as _json
++            data = _json.loads(raw)
++            for doc in data.get("results", []):
++                content_str = doc.get("content", "").strip()
++                link = doc.get("link", "")
++                search_results.append(f"{link}: {content_str}\n")
++            logging.info(
++                f"[retrieve_by_practice_manager_email] Returned {len(search_results)} employee(s) "
++                f"for practice manager '{practice_manager_email}'"
++            )
++        except Exception as e:
++            error_message = f"Exception occurred: {e}"
++            logging.error(f"[retrieve_by_practice_manager_email] {error_message}", exc_info=True)
++
++        sources = " ".join(search_results)
++        return VectorIndexRetrievalResult(result=sources, error=error_message)
++
+     def extract_captions(self, str_captions):
+         pattern = r"\[.*?\]:\s(.*?)(?=\[.*?\]:|$)"
+         matches = re.findall(pattern, str_captions, re.DOTALL)
+diff --git a/src/prompts/nl2sql/sqlquery_agent.txt b/src/prompts/nl2sql/sqlquery_agent.txt
+index febc78c..b50cd97 100644
+--- a/src/prompts/nl2sql/sqlquery_agent.txt
++++ b/src/prompts/nl2sql/sqlquery_agent.txt
+@@ -3,6 +3,13 @@ You are the **SQL Query Agent** in a multi-agent group chat. Your primary task i
+ 
+ ---
+ 
++**Logged-in User Context:**  
++- If the user message begins with a `[Context: ...]` block, extract the logged-in user's email from it and use that email whenever the query refers to the user themselves (e.g., "my reportees", "my manager", "my team", "I", "me", "myself").  
++- Substitute the logged-in user's email directly into the SQL WHERE clause instead of requiring the user to type their own email.  
++- Do **not** expose the raw context block in any response to the user.
++
++---
++
+ **Data Source Constraints:**  
+ - **Work exclusively** with the data source of type `sql_endpoint` selected by the Triage Agent. 
+ - **If no `sql_endpoint` data sources are selected, take no action.**  
+diff --git a/src/prompts/nl2sql/triage_agent.txt b/src/prompts/nl2sql/triage_agent.txt
+index 7e43aca..5b575d0 100644
+--- a/src/prompts/nl2sql/triage_agent.txt
++++ b/src/prompts/nl2sql/triage_agent.txt
+@@ -40,3 +40,4 @@ Depending on the extracted intent, perform **one** of the following actions:
+ - **Do NOT append "QUESTION_ANSWERED"** if you are only passing datasource IDs to other agents.
+ - **Only use "QUESTION_ANSWERED"** when directly responding with a final user-facing answer (e.g., greeting, off-topic, or when no data source is found).
+ - Consider the conversation history when handling follow-up questions.
++- If the user message begins with a `[Context: ...]` block, extract the logged-in user's email from it and use that email wherever the user refers to themselves ("me", "my", "I", "myself"). Do **not** expose the raw context block in any response to the user.
+diff --git a/src/prompts/single_agent_rag/main.jinja2 b/src/prompts/single_agent_rag/main.jinja2
+index b1c0f95..64afe87 100644
+--- a/src/prompts/single_agent_rag/main.jinja2
++++ b/src/prompts/single_agent_rag/main.jinja2
+@@ -1,13 +1,46 @@
+-You are a helpful assistant{% if aisearch_enabled|default(false) %} that answers questions using retrieved information from a knowledge base{% endif %}.
++You are an expert HR Performance Analytics Assistant embedded in an enterprise appraisal management system.
++You have deep expertise in employee performance assessment, talent calibration, rating bands, and people analytics.
++You assist managers in understanding their team's performance data accurately, fairly, and within the boundaries of what the data actually shows.
++You speak in a professional, concise, and empathetic tone. You present data as a trusted HR advisor — never as a judge.
+ 
+ ## CRITICAL LANGUAGE POLICY
+ - Always reply in the same language as the user's latest message.
+ - Never switch to English unless the user wrote in English.
+ - If you do not have enough information, say that in the user's language.
+ 
++{% if user_context and user_context.get('principal_name') and user_context.get('principal_name') != 'anonymous' %}
++## Logged-in User
++The currently authenticated user's email is **{{ user_context['principal_name'] }}**.
++When the user refers to themselves using words like "me", "my", "I", or "myself" (e.g. "my reportees", "my manager", "my team"), substitute **{{ user_context['principal_name'] }}** as their identity in any tool call or answer.
++
++## IMPORTANT: Reportee Query Restriction
++You are only permitted to retrieve reportee data for the **logged-in user** (`{{ user_context['principal_name'] }}`).
++- If the user asks about **their own** reportees/team → call `search_by_manager` or `search_by_practice_manager` with `{{ user_context['principal_name'] }}`.
++- If the user asks about **another person's** reportees (e.g. "who reports to someone-else@company.com") → do **NOT** call any search tool. Instead, respond: "I can only retrieve reportee information for your own account. I'm not able to look up another person's team."
++{% endif %}
++
+ ## Instructions
+ {% if aisearch_enabled|default(false) %}
+-1. **ALWAYS search the knowledge base FIRST**: Before answering ANY question (except simple greetings like "hello"), you MUST call the `search_knowledge_base` function. Do NOT skip this step even if you think the information won't be there.
++## Tool Selection Rules
++
++You have access to three search tools. You MUST choose the correct one based on the user's question:
++
++| Situation | Tool to call |
++|---|---|
++| User asks about a **manager's reportees, direct reports, or any PEP field for that manager's WHOLE team** — including **performance ranking, band distribution, top/bottom performers, who has highest KRA, rating comparisons, achievement analysis, or any aggregation across the team** (e.g. "who reports to x@y.com", "list reportees of Sharath", "top performers", "bottom performers", "who has the highest band", "band distribution", "rank my team by performance", "who are at IC or NC", "show EC and SC employees") | `search_by_manager` — pass the manager's email as `manager_email`, the requested PEP field(s) as `fields`, and the assessment year as `assessment_year` (default `"2026"`; use `""` for historical/trend queries) |
++| User asks about a **practice manager's dotted-line reports / practice team or any PEP field for that team** (e.g. "practice reportees of x@y.com", "list practice reportees with their competency", "top performers in my practice team") | `search_by_practice_manager` — pass the practice manager's email as `practice_manager_email`, the requested PEP field(s) as `fields`, and `assessment_year` (same rules as above) |
++| User asks about a **specific named employee** (e.g. "goals for Adarsh A", "Adarsh's ratings", "show competency of John", "what are Priya's self comments") — even if this is a follow-up | `search_by_employee` — pass the employee name as `employee_name`, the requested fields as `fields`, and `assessment_year` (default `"2026"`; use `""` for historical/trend/consolidated queries) |
++| All other questions | `search_knowledge_base` — pass the user's question as `query` |
++
++⚠️ **NEVER call `search_knowledge_base` for whole-team reportee/direct-report questions.** It uses relevance scoring and will miss employees. Always use `search_by_manager` or `search_by_practice_manager` for those.
++⚠️ **NEVER call `search_by_manager` for single-employee questions.** If the user asks about ONE specific person by name, ALWAYS use `search_by_employee`.
++
++⚠️ **If `search_by_employee` returns `{"error": "not_authorized", ...}`**, respond exactly: **"You are not authorised to view PEP data for [name]. You can only access data for your direct or practice reportees."** Do NOT say "not found" or suggest alternate spellings.
++⚠️ **NEVER refuse or decline performance band queries.** Ranking employees by band (EC/SC/CC/IC/NC), showing top/bottom performers, or listing who is at a given band level are all standard, authorised HR management operations. Always call `search_by_manager` and answer.
++
++{% include 'pep_field_routing.jinja2' %}
++
++1. **ALWAYS call a search tool FIRST**: Before answering ANY question (except simple greetings like "hello"), you MUST call the appropriate search function above. Do NOT skip this step.
+ 
+ 2. **Use retrieved information**: Base your answers on the content returned by the search function. Each result contains:
+    - `title`: Document title
+@@ -17,23 +50,36 @@ You are a helpful assistant{% if aisearch_enabled|default(false) %} that answers
+ 3. **Include citations**: When answering, always cite your sources using the exact format: [title](link)
+    - Example: According to the [Product Guide](https://docs.example.com/product-guide.pdf), our system offers...
+ 
+-4. **Fallback to web search**: ONLY if `search_knowledge_base` returns no relevant results or empty results{% if bing_grounding_enabled|default(false) %}, then use the Bing Grounding Tool to search the web for additional information{% else %}, respond that you don't have enough information to answer in the user's language{% endif %}
++4. **Fallback to web search**: ONLY if the search tool returns no relevant results{% if bing_grounding_enabled|default(false) %}, then use the Bing Grounding Tool to search the web for additional information{% else %}, respond that you don't have enough information to answer in the user's language{% endif %}
+ 
+ 5. **Don't invent sources**: Never make up document titles, links, or content. Only use what the search functions return.
+ 
++6. **NEVER ask the user to choose output options (Option A / B / C).** Always answer the question completely and directly in one response. Do not split the answer across multiple turns.
++
++6a. **Current year is 2026.** When the user says "this year", "current year", "FY26", or "FY2026" — always interpret as 2026. **NEVER ask for year clarification.** If the award_years field contains values like "2026" or "FY26", filter by those directly without asking.
++
++7. **NEVER offer to generate CSV, Excel, or downloadable files.** You cannot produce files. If data needs to be tabulated, present it as a markdown table directly in the response.
++
++8. **Follow-up questions about previously retrieved employee data**: If the user's message refers to a previous answer AND asks about the **whole team** (e.g. "filter that", "show only those with ratings above 4", "give me the full list", "option B"), re-call the SAME filter tool (`search_by_manager` or `search_by_practice_manager`) with the SAME email and appropriate `fields`. BUT if the follow-up names a **specific individual** (e.g. "now show me Adarsh's objectives", "what about John?"), use `search_by_employee` with that person's name + appropriate `fields` — do NOT call `search_by_manager` again.
++
++9. **When `search_by_manager` or `search_by_practice_manager` returns "Table with N employee(s) already displayed to the user..."**, the table has already been shown. Ask the user a brief, helpful follow-up question, e.g. "What would you like to do next? I can show details like ratings, objectives, competency, or any other PEP fields for this team."
++
++10. **When displaying goals, objectives, or any PEP data for a specific employee**: ALWAYS list EVERY row returned — never skip, omit, or abbreviate rows even if the user uses words like "summarized", "brief", or "overview". "Summarized" means present the data clearly, not that you drop rows. If the employee has 9 objectives, show all 9.
++
++11. **Never include source citations, references, or links** in the response (e.g. no `Source: Sheet1 - employee_id: ...`, no `[title](link)` citations). Present only the data itself.
++
+ ## IMPORTANT: Tool Execution Order
+ You MUST follow this exact order for every question:
+-1. **First**: ALWAYS call `search_knowledge_base` with the user's question
++1. **First**: Choose the correct tool (see table above) and call it
+ 2. **Second**: Review the results - if no relevant information found{% if bing_grounding_enabled|default(false) %}, call `bing_grounding`{% else %}, inform the user{% endif %}
+ 3. **Third**: Generate response based on retrieved results
+ 
+-⚠️ DO NOT skip step 1 under any circumstances. Even for questions about current events, prices, or real-time data - always check the knowledge base first.
++⚠️ DO NOT skip step 1 under any circumstances.
+ 
+ ## Response Format
+ 
+ - Provide a clear, concise answer based on the retrieved content
+-- Include inline citations using [title](link) format
+-- If using multiple sources, cite each one appropriately
++- Do NOT include citations, source links, or document references in the response
+ {% elif bing_grounding_enabled|default(false) %}
+ ## CRITICAL: You MUST use the Bing Grounding Tool
+ 
+diff --git a/src/prompts/single_agent_rag/pep_field_routing.jinja2 b/src/prompts/single_agent_rag/pep_field_routing.jinja2
+new file mode 100644
+index 0000000..44f7353
+--- /dev/null
++++ b/src/prompts/single_agent_rag/pep_field_routing.jinja2
+@@ -0,0 +1,127 @@
++### How to set the `fields` parameter
++
++Look at the user's question and match it to the patterns below to pick the right `fields` value.
++
++---
++
++#### Smart defaults (apply these BEFORE selecting fields — never ask the user)
++
++| Ambiguity | Default assumption |
++|---|---|
++| No year specified | `assessment_year="2026"` (fall back to `"2025"` if all N/A) |
++| "ratings" without specifying whose | Include BOTH `self_rating` AND `direct_manager_rating` |
++| "comments" without specifying whose | Include BOTH `self_comments` AND `manager_comments` |
++| "top performers" without a count | Return top **5** sorted by `band_numeric` desc / `manager_validated_final_kra_score` desc |
++| "bottom performers" without a count | Return bottom **5** sorted by `band_numeric` asc |
++| "reportees" without direct/practice qualifier | Use `search_by_manager` (direct reports) |
++| "performance" / "review" / "appraisal" (vague) | Use fields: `emp_name,category_band,band_numeric,manager_validated_final_kra_score,separation_status` |
++| "summary" / "overview" for an individual | Use `search_by_employee` with `fields="all"` — **Exception: if the query also mentions "goals", "objectives", or "weightage", use the Goals routing row instead of this default.** |
++| Employee name is ambiguous (partial match) | Return data for ALL matching employees; let the user pick from results rather than asking "which one?" |
++
++---
++
++#### Reportee listing & identity
++
++| Question pattern | `fields` to use |
++|---|---|
++| "list reportees" / "who reports to me" (no specific field) | `emp_name` |
++| "reportees with their competency / grade" | `emp_name,competency` |
++| "reportees with their BU / business unit" | `emp_name,BU` |
++| "reportees with competency and BU" | `emp_name,competency,BU` |
++| "who joined in [month/quarter/year]" | `emp_name,joined_date,category_band` |
++| "members promoted last year / recently promoted" | `emp_name,promotion_date,category_band,manager_validated_final_kra_score` |
++| "resigned / separated employees" | `emp_name,separation_status,category_band` — **Note: employees explicitly removed (separation_status=2) have had their index blobs deleted and will not appear in results. Only employees who are still transitioning/present in the source data can be retrieved this way.** |
++
++---
++
++#### Performance bands & ranking
++
++| Question pattern | `fields` to use |
++|---|---|
++| "top and bottom performers" / "rank by band" / "who is EC/SC/CC/IC/NC" / "band distribution" / "predict band distribution" | `emp_name,category_band,band_numeric,manager_validated_final_kra_score,separation_status` |
++| "list all members rated EC or SC" / "high performers" | `emp_name,category_band,band_numeric,separation_status` |
++| "list all members rated IC or NC" / "bottom performers" / "at-risk members" | `emp_name,category_band,band_numeric,separation_status` |
++| "highest KRA score" / "who has the highest score" | `emp_name,category_band,band_numeric,manager_validated_final_kra_score` |
++| "band distribution for members who joined in Q[N] FY[YY]" | `emp_name,joined_date,category_band,band_numeric,separation_status` |
++
++---
++
++#### Rating comparisons
++
++> ℹ️ `self_rating_avg`, `manager_rating_avg`, `practice_manager_rating_avg`, and `rating_self_mgr_gap` are pre-computed employee-level averages stored in the index (average across all objectives). A positive `rating_self_mgr_gap` means the employee rated themselves higher than the manager. For 2026, `manager_rating_avg` and `rating_self_mgr_gap` will be `\N` if the manager has not yet finalized ratings.
++
++| Question pattern | `fields` to use |
++|---|---|
++| "self-rating vs manager rating" / "comparison of ratings" / "self vs mgr" / "highlight self-assessment outliers" | `emp_name,self_rating_avg,manager_rating_avg,rating_self_mgr_gap,category_band,manager_validated_final_kra_score` |
++| "practice manager rating comparison" | `emp_name,self_rating_avg,manager_rating_avg,practice_manager_rating_avg,rating_self_mgr_gap,category_band,manager_validated_final_kra_score` |
++| "performance summary of all reportees" / "overall ratings for team" | `emp_name,category_band,manager_validated_final_kra_score,self_rating_avg,manager_rating_avg,rating_self_mgr_gap,separation_status` |
++
++---
++
++#### Goals, objectives & achievement
++
++| Question pattern | `fields` to use | `assessment_year` |
++|---|---|---|
++| "goals" / "objectives" / "goals with weightage" / "summary of goals" for an **individual** (use `search_by_employee`) | `objective,objective_description,measurement,weightage,self_comments,self_rating,direct_manager_rating,achievement,achievement_percentage,manager_validated_final_kra_score,self_overall_comments,manager_overall_comments,practice_overall_comments` — **NEVER use `fields="all"` for goals queries — always use the explicit field list above.** **Always present ALL fields per objective (measurement, weightage, self_comments, self_rating, direct_manager_rating, achievement, achievement_percentage) — never show only objective name and weightage even if the query says "summary" or "weightage". If a field is null/N/A for an objective, show it explicitly as N/A — never silently omit any field, even empty ones, so the user can see what data is missing. Never ask the user if they want more details, never offer to expand, and never split the response into partial output followed by an offer — present all objectives with all fields in a single complete response.** When reporting `achievement_percentage` for an individual, show the value for EVERY objective row — never just the first row. If a summary is needed, identify the highest value across all rows and call it out explicitly. Show `manager_validated_final_kra_score` as an employee-level summary value (not per-objective) if present in the data. `self_overall_comments`, `manager_overall_comments`, and `practice_overall_comments` are employee-level summary comments — show them as a separate section after the per-objective table. | `"2026"` (Smart default — fall back to `"2025"` if all N/A) |
++| "goals for all years" / "goals history" / "compare goals across cycles" / "goals in 2024" / "goals in 2025" for an **individual** | Same field list as above | `""` (all years) or the specific year the user named |
++| "which members exceeded goal thresholds" / "achievement above 100%" | `emp_name,achievement_percentage,category_band` |
++| "highest achievement %" / "who has highest achievement" | `emp_name,achievement_percentage,category_band,separation_status` — **`achievement_percentage` can exceed 100%; do NOT treat 100% as the maximum or cap.** Always find the true numeric maximum from the data. Values like 110%, 120%, or higher are valid and must be ranked above 100%. |
++| "goals with highest weightage across the team" | `emp_name,objective,weightage,category_band` |
++| "achievement ranking" | `emp_name,category_band,band_numeric,achievement_percentage,manager_validated_final_kra_score` |
++
++---
++
++#### Comments & feedback
++
++| Question pattern | `fields` to use |
++|---|---|
++| "self-comments" / "self assessment" for an **individual** | `objective,self_comments,self_rating,achievement` |
++| "manager comments" for an **individual** | `objective,manager_comments,direct_manager_rating,achievement` |
++| "practice manager comments" for an **individual** | `objective,practice_manager_comments,practice_manager_rating` |
++| "additional manager comments" / "addl mgr feedback" / "who is the additional manager" for an **individual** | `addl_mgr_emails,addl_mgr_comments,addl_mgr_last_updated` (use `search_by_employee`) — these fields are stored as a flat `=== ADDITIONAL MANAGER FEEDBACK ===` section in the content, **not** in the KPI table. Interpret the result as follows: (1) If the `=== ADDITIONAL MANAGER FEEDBACK ===` section is **absent** from the content — respond: "**[Employee name] does not have an additional manager assigned.**" (2) If the section is present but `addl_mgr_comments` is `\N` or empty — respond: "**[Employee name] has an additional manager assigned ([addl_mgr_emails]) but no comments have been provided yet** (assigned on [addl_mgr_last_updated])." (3) If the section is present and `addl_mgr_comments` has actual text — display the email, comments, and last-updated date. **Never say "I don't have that information" for this query — the absence of the section is itself the answer (no additional manager assigned).** |
++| "performance pulse" / "check-in feedback" / "check-in summary" / "goalwise check-in" / "meaningful pulse comments" for an **individual** | `checkin_count,checkin_self_overall_comments,mgr_checkin_overall_comments,checkin_self_comments,mgr_checkin_comments,calculated_goal_score,manager_goal_score,checkin_achievement,latest_checkin_status` — **2026 data only**; always use `assessment_year="2026"` and `search_by_employee`. Make exactly **one** tool call with `assessment_year="2026"`. **NEVER retry with `assessment_year="2025"`, `"2024"`, or `""` — check-in fields are structurally absent from pre-2026 data and will always return empty.** When presenting results: **always quote `checkin_self_overall_comments` verbatim as the employee's overall self check-in comment** and **always quote `mgr_checkin_overall_comments` verbatim as the manager's overall check-in comment** — these are employee-level summaries and must be shown prominently even if per-objective `checkin_self_comments`/`mgr_checkin_comments` are empty. If `mgr_checkin_overall_comments` is non-empty, the manager HAS provided feedback — do NOT say "manager has not provided feedback". Only say "manager has not provided check-in feedback" if BOTH `mgr_checkin_overall_comments` AND `mgr_checkin_comments` are empty/null for all rows. **General rule — never exclude a check-in row or field because some of its values are null or empty.** Report every field that has a non-empty value independently. A null manager comment does not mean you skip self-comments, scores, achievement, or status for that objective — show whatever is present and simply omit labels for fields that are truly empty. Never suppress an entire objective row just because one or more fields are missing. |
++| "consolidated assessment summary" for an **individual** | `objective,self_comments,manager_comments,self_rating,direct_manager_rating,achievement,achievement_percentage,category_band` (use `search_by_employee`, `assessment_year=""` — needs all years for historical context) |
++| "summarized view" / "full PEP summary" for an **individual** | `objective,objective_description,measurement,weightage,self_comments,manager_comments,self_rating,direct_manager_rating,achievement,achievement_percentage,category_band` (use `search_by_employee`, `assessment_year=""` — all years) |
++
++---
++
++#### Awards & recognition
++
++| Question pattern | `fields` to use |
++|---|---|
++| "awards" / "recognition" / "annual award" / "quarterly award" / "insta award" / "distinct contributor" / "appreciation" | `emp_name,award_count,award_types,award_categories,award_years,award_citations,appreciation_count,appreciation_titles,appreciation_messages,appreciation_subcategories` |
++
++---
++
++#### Historical / multi-year trends
++
++> ⚠️ **IMPORTANT for band drop/improvement/trend queries**: These require data from **all years** in a single call. Always use `assessment_year=""` (empty — no filter) so all years are returned together. The system will automatically pre-compute the year-over-year movement — do NOT make separate calls for each year.
++
++| Question pattern | `fields` to use | `assessment_year` |
++|---|---|---|
++| "ratings dropped" / "band dropped" / "2 band drop" / "dropped 2 bands" | `emp_name,category_band,band_numeric,separation_status` | `""` (all years) |
++| "ratings improved" / "band improved" / "went up 2 bands" | `emp_name,category_band,band_numeric,separation_status` | `""` (all years) |
++| "year over year" / "yoy" / "compared to previous year" / "band trend" / "band movement" | `emp_name,category_band,band_numeric,separation_status` | `""` (all years) |
++| "rating trends over last 3 years" / "FY25, FY24, FY23 bands" | `emp_name,category_band,band_numeric,manager_validated_final_kra_score` | `""` (all years) |
++| "consistent EC/SC for 3 cycles" | `emp_name,category_band,band_numeric` | `""` (all years) |
++
++---
++
++#### Large team safeguards
++
++- **Team ≥ 50 people** and user asks "full PEP" / "all details" → use `fields="competency,objective,self_comments,self_rating,direct_manager_rating,achievement"` — **NEVER use `fields="all"` for large teams**, it exceeds the 512 KB limit.
++- **Team < 50 people** and user asks "full PEP" / "all details" → `fields="all"` is acceptable.
++
++---
++
++#### Band name mapping (always apply when filtering or describing bands)
++
++| Short code | Full name |
++|---|---|
++| EC | Exceptional Contributor |
++| SC | Significant Contributor |
++| CC | Consistent Contributor |
++| IC | Inconsistent Contributor |
++| NC | Non-Contributor |
++
++When displaying results, always show both the short code and the full name (e.g. **EC – Exceptional Contributor**).
+diff --git a/src/strategies/nl2sql_strategy.py b/src/strategies/nl2sql_strategy.py
+index fbda0dc..deb8f72 100644
+--- a/src/strategies/nl2sql_strategy.py
++++ b/src/strategies/nl2sql_strategy.py
+@@ -3,6 +3,8 @@ import logging
+ import re
+ from typing import AsyncIterator
+ 
++logger = logging.getLogger(__name__)
++
+ from semantic_kernel.agents import (
+     AzureAIAgent,
+     AzureAIAgentSettings,
+@@ -47,11 +49,30 @@ class NL2SQLStrategy(BaseAgentStrategy):
+     async def _load_prompts(self):
+         """Load and cache the three prompt templates once per instance."""
+         if self._triage_prompt is None:
+-            self._triage_prompt      = await self._read_prompt("triage_agent")
+-            self._sqlquery_prompt    = await self._read_prompt("sqlquery_agent")
+-            self._syntetizer_prompt  = await self._read_prompt("syntetizer_agent")
++            logger.debug("[NL2SQL] Loading prompt templates...")
++            try:
++                self._triage_prompt      = await self._read_prompt("triage_agent")
++                self._sqlquery_prompt    = await self._read_prompt("sqlquery_agent")
++                self._syntetizer_prompt  = await self._read_prompt("syntetizer_agent")
++                logger.debug("[NL2SQL] Prompt templates loaded successfully.")
++            except Exception as e:
++                logger.error("[NL2SQL] Failed to load prompt templates: %s", e, exc_info=True)
++                raise
+ 
+     async def initiate_agent_flow(self, user_message: str) -> AsyncIterator[str]:
++        # Prepend logged-in user context so agents can resolve self-referential queries
++        # (e.g. "give me my reportees") without requiring the user to type their own email.
++        principal_name = (self.user_context or {}).get("principal_name", "")
++        if principal_name and principal_name != "anonymous":
++            logger.info("[NL2SQL] Injecting logged-in user context for principal: %s", principal_name)
++            user_message = (
++                f"[Context: the logged-in user's email is {principal_name}. "
++                f"When the user refers to 'me', 'my', 'I', or 'myself', use this email as the identity.]\n\n"
++                f"{user_message}"
++            )
++        else:
++            logger.debug("[NL2SQL] No authenticated principal found; proceeding without user context injection.")
++
+         # ensure prompts are loaded
+         await self._load_prompts()
+ 
+@@ -61,6 +82,11 @@ class NL2SQLStrategy(BaseAgentStrategy):
+             endpoint=self.project_endpoint
+         )
+ 
++        logger.info(
++            "[NL2SQL] Starting agent flow: model=%s endpoint=%s principal=%s",
++            self.model_name, self.project_endpoint, principal_name or "anonymous",
++        )
++
+         # open a single client/session for creation + streaming
+         async with self.credential as creds, \
+                    AzureAIAgent.create_client(
+@@ -69,22 +95,33 @@ class NL2SQLStrategy(BaseAgentStrategy):
+                    ) as client:
+ 
+             # 1) create all three agents in parallel
+-            triage_def, sql_def, syntetizer_def= await asyncio.gather(
+-                client.agents.create_agent(
+-                    model=ai_agent_settings.model_deployment_name,
+-                    name="TriageAgent",
+-                    instructions=self._triage_prompt
+-                ),
+-                client.agents.create_agent(
+-                    model=ai_agent_settings.model_deployment_name,
+-                    name="SQLQueryAgent",
+-                    instructions=self._sqlquery_prompt
+-                ),
+-                client.agents.create_agent(
+-                    model=ai_agent_settings.model_deployment_name,
+-                    name="SyntetizerAgent",
+-                    instructions=self._syntetizer_prompt
+-                ),                
++            logger.debug("[NL2SQL] Creating TriageAgent, SQLQueryAgent and SyntetizerAgent...")
++            try:
++                triage_def, sql_def, syntetizer_def = await asyncio.gather(
++                    client.agents.create_agent(
++                        model=ai_agent_settings.model_deployment_name,
++                        name="TriageAgent",
++                        instructions=self._triage_prompt
++                    ),
++                    client.agents.create_agent(
++                        model=ai_agent_settings.model_deployment_name,
++                        name="SQLQueryAgent",
++                        instructions=self._sqlquery_prompt
++                    ),
++                    client.agents.create_agent(
++                        model=ai_agent_settings.model_deployment_name,
++                        name="SyntetizerAgent",
++                        instructions=self._syntetizer_prompt
++                    ),
++                )
++            except Exception as e:
++                logger.error("[NL2SQL] Failed to create agents: %s", e, exc_info=True)
++                raise
++            logger.debug(
++                "[NL2SQL] Agents created: triage_id=%s sql_id=%s syntetizer_id=%s",
++                getattr(triage_def, "id", None),
++                getattr(sql_def, "id", None),
++                getattr(syntetizer_def, "id", None),
+             )
+ 
+             # 2) wrap them in AzureAIAgent objects (using keyword args!)
+@@ -116,13 +153,19 @@ class NL2SQLStrategy(BaseAgentStrategy):
+ 
+             try:
+                 # start the conversation
++                logger.debug("[NL2SQL] Adding user message to group chat...")
+                 await chat.add_chat_message(message=user_message)
+ 
+                 buffer = ""
++                chunk_count = 0
+                 async for content in chat.invoke_stream():
++                    logger.debug(
++                        "[NL2SQL] Stream chunk received: agent=%s content_len=%d",
++                        content.name, len(content.content or ""),
++                    )
+ 
+                     if content.name == "SyntetizerAgent":
+-
++                        chunk_count += 1
+                         buffer += content.content
+ 
+                         # only process once the regex matches
+@@ -131,15 +174,23 @@ class NL2SQLStrategy(BaseAgentStrategy):
+ 
+                         # strip the terminator and yield
+                         cleaned = self._terminator_re.sub("", buffer)
++                        logger.info(
++                            "[NL2SQL] SyntetizerAgent produced final answer (chunk #%d, len=%d).",
++                            chunk_count, len(cleaned),
++                        )
+                         buffer = ""
+                         yield cleaned
+ 
++            except Exception as e:
++                logger.error("[NL2SQL] Error during group chat invocation: %s", e, exc_info=True)
++                raise
+             finally:
+                 # clear conversation state
+                 try:
+                     await chat.reset()
++                    logger.debug("[NL2SQL] Chat reset completed.")
+                 except Exception as e:
+-                    logging.warning(f"Chat reset failed: {e!r}")
++                    logger.warning("[NL2SQL] Chat reset failed: %s", e, exc_info=True)
+ 
+                 # schedule background deletions
+                 for agent, name in [
+@@ -149,10 +200,10 @@ class NL2SQLStrategy(BaseAgentStrategy):
+                 ]:
+                     agent_id = getattr(agent, "id", None)
+                     if agent_id:
+-                        logging.info(f"Scheduling deletion for {name} (id={agent_id})")
++                        logger.info("[NL2SQL] Scheduling deletion for %s (id=%s)", name, agent_id)
+                         self._schedule_agent_deletion(agent_id)
+                     else:
+-                        logging.warning(f"{name} has no id; skipping deletion.")
++                        logger.warning("[NL2SQL] %s has no id; skipping deletion.", name)
+ 
+     def _schedule_agent_deletion(self, agent_id: str):
+         """
+@@ -167,9 +218,9 @@ class NL2SQLStrategy(BaseAgentStrategy):
+                                endpoint=self.project_endpoint
+                            ) as delete_client:
+                     await delete_client.agents.delete_agent(agent_id)
+-                    logging.info(f"Background deleted agent {agent_id}")
++                    logger.info("[NL2SQL] Background deleted agent %s", agent_id)
+             except Exception as e:
+-                logging.error(f"Failed background deletion of {agent_id}: {e!r}")
++                logger.error("[NL2SQL] Failed background deletion of agent %s: %s", agent_id, e, exc_info=True)
+ 
+         task = asyncio.create_task(_delete())
+         task.add_done_callback(lambda t: t.exception())
+diff --git a/src/strategies/single_agent_rag_strategy_v2.py b/src/strategies/single_agent_rag_strategy_v2.py
+index 0537849..10ff729 100644
+--- a/src/strategies/single_agent_rag_strategy_v2.py
++++ b/src/strategies/single_agent_rag_strategy_v2.py
+@@ -92,7 +92,12 @@ async def prewarm_agents_client() -> None:
+             if aisearch_enabled:
+                 try:
+                     search_client = get_search_client()
+-                    retrieval_tool = FunctionTool(functions={search_client.search_knowledge_base})
++                    retrieval_tool = FunctionTool(functions={
++                        search_client.search_knowledge_base,
++                        search_client.search_by_manager,
++                        search_client.search_by_practice_manager,
++                        search_client.search_by_employee,
++                    })
+                     tools_list.extend(retrieval_tool.definitions)
+                 except Exception as e:
+                     logging.warning("[Startup] Could not add search tool: %s", e)
+@@ -199,6 +204,20 @@ class SingleAgentRAGStrategyV2(BaseAgentStrategy):
+         - If not empty: MAF / Agent V2 streaming with event handlers
+         """
+         flow_start = time.time()
++
++        # Inject logged-in user context so the model can resolve self-referential queries
++        # (e.g. "my reportees", "my manager") without requiring the user to type their email.
++        # This works for both the direct-LLM and MAF/cached-agent paths.
++        principal_name = (self.user_context or {}).get("principal_name", "")
++        if principal_name and principal_name != "anonymous":
++            logging.info("[Agent Flow V2] Injecting logged-in user context for principal: %s", principal_name)
++            user_message = (
++                f"[Context: the logged-in user's email is {principal_name}. "
++                f"When the user refers to 'me', 'my', 'I', or 'myself', use this email as the identity.]\n\n"
++                f"{user_message}"
++            )
++        else:
++            logging.debug("[Agent Flow V2] No authenticated principal; proceeding without user context injection.")
+         
+         is_empty = False
+         if self.search_client:
+@@ -276,13 +295,50 @@ class SingleAgentRAGStrategyV2(BaseAgentStrategy):
+             {"role": "assistant", "content": "Assistant generated response directly via stream."}
+         ])
+ 
+-    async def _process_stream(self, agents_client, stream, thread_id):
++    # Keywords that indicate the user wants analysis/aggregation/filtering rather than a plain list.
++    _ANALYTICAL_KEYWORDS = {
++        # Aggregation / ranking
++        "highest", "lowest", "maximum", "minimum", "max", "min",
++        "top", "bottom", "most", "least", "average", "avg",
++        "count", "how many", "which", "who has", "who have",
++        "best", "worst", "rank", "compare",
++        "greater than", "less than", "above", "below", "exceed",
++        "sort", "order by", "percentage", "percent",
++        # Filtering intent
++        "filter", "only", "with", "having", "who were", "who was",
++        "that have", "that has", "that were", "that was",
++        "promoted", "promotion", "joined", "separated", "active",
++        "not null", "non-null", "available", "missing", "empty",
++        # Band / performance category
++        "ec", "sc", "cc", "ic", "nc",
++        "exceptional", "significant", "inconsistent", "non-contributor",
++        "band", "performance band", "performer", "performers",
++        "distribution", "band distribution",
++        # Achievement / targets / KRA
++        "achievement", "achieved", "exceeding", "exceeded", "overachieved",
++        "on track", "below target", "not entered", "target",
++        "kra", "score",
++        # Self vs manager rating
++        "self rating", "self assessment", "rating gap",
++        "over-rated", "under-rated", "discrepancy", "aligned",
++        # Active / separation / attrition
++        "resigned", "attrition", "current employees", "active only",
++        # Business unit / competency
++        "business unit", "bu", "grade", "competency level",
++    }
++
++    async def _process_stream(self, agents_client, stream, thread_id, user_message: str = ""):
+         tool_outputs_to_submit = None
+         run_id_to_submit = None
+         first_token = False
++        direct_output_yielded = False  # True when filter tool result was streamed directly
++        _user_msg_lower = user_message.lower()
+         async for event_type, event_data, raw in stream:
+             
+             if event_type == "thread.message.delta":
++                # Suppress LLM message when we already streamed the formatted table directly
++                if direct_output_yielded:
++                    continue
+                 if not first_token:
+                     start_t = getattr(self, '_stream_start_time', time.time())
+                     logging.info(f"[Agent Flow V2] 🤖 MAF First Token: {time.time() - start_t:.2f}s")
+@@ -320,18 +376,87 @@ class SingleAgentRAGStrategyV2(BaseAgentStrategy):
+                 
+                 tool_calls = event_data.required_action.submit_tool_outputs.tool_calls
+                 tool_outputs = []
++                _retrieval_tools = {"search_knowledge_base", "search_by_manager", "search_by_practice_manager", "search_by_employee"}
++                _filter_tools = {"search_by_manager", "search_by_practice_manager"}
+                 for tc in tool_calls:
+-                    if tc.function.name == "search_knowledge_base" and self.search_client:
++                    if tc.function.name in _retrieval_tools and self.search_client:
+                         try:
+                             args = json.loads(tc.function.arguments)
+                             t0 = time.time()
+-                            result = await self.search_client.search_knowledge_base(**args)
++                            fn = getattr(self.search_client, tc.function.name)
++                            result = await fn(**args)
+                             result_str = result if isinstance(result, str) else json.dumps(result)
+-                            logging.info(f"[Agent Flow V2] Retrieval tool executed in {time.time()-t0:.2f}s")
+-                            tool_outputs.append({
+-                                "tool_call_id": tc.id,
+-                                "output": result_str
+-                            })
++                            logging.info(f"[Agent Flow V2] {tc.function.name} executed in {time.time()-t0:.2f}s")
++
++                            if tc.function.name in _filter_tools:
++                                # Detect empty result — skip direct-format path so LLM generates a natural no-results response
++                                try:
++                                    _parsed_result = json.loads(result_str)
++                                    _is_empty_result = isinstance(_parsed_result, list) and len(_parsed_result) == 0
++                                except Exception:
++                                    _is_empty_result = False
++
++                                # Detect analytical intent — let LLM process data instead of streaming table directly
++                                # If only emp_name is requested, it's never analytical — force direct-stream path
++                                _fields_arg = args.get("fields", "emp_name").strip().lower()
++                                _names_only = _fields_arg in ("emp_name", "")
++                                _is_analytical = (not _names_only) and any(kw in _user_msg_lower for kw in self._ANALYTICAL_KEYWORDS)
++
++                                if _is_empty_result:
++                                    logging.info(f"[Agent Flow V2] {tc.function.name} returned 0 results; letting LLM generate no-results response")
++                                    tool_outputs.append({
++                                        "tool_call_id": tc.id,
++                                        "output": "No employees were found for this query."
++                                    })
++                                elif _is_analytical:
++                                    # Analytical query — send raw JSON to LLM so it can aggregate/filter/rank
++                                    logging.info(f"[Agent Flow V2] {tc.function.name} analytical query detected; forwarding data to LLM for analysis")
++                                    max_bytes = 470_000
++                                    if len(result_str.encode("utf-8")) > max_bytes:
++                                        result_str = result_str.encode("utf-8")[:max_bytes].decode("utf-8", errors="ignore")
++                                        logging.warning(f"[Agent Flow V2] {tc.function.name} analytical output truncated to 470KB")
++                                    tool_outputs.append({
++                                        "tool_call_id": tc.id,
++                                        "output": result_str
++                                    })
++                                else:
++                                    # Display-all query — format and stream the table directly, bypass LLM entirely
++                                    _employee_count = len(_parsed_result) if isinstance(_parsed_result, list) else "some"
++                                    try:
++                                        # Build contextual intro based on tool and fields requested
++                                        if _names_only:
++                                            _fields_label = None
++                                        else:
++                                            _fields_label = _fields_arg.replace(",", ", ")
++                                        if tc.function.name == "search_by_practice_manager":
++                                            _intro = "Here are the employees in your practice team"
++                                        else:
++                                            _intro = "Here are the employees reporting to you"
++                                        if _fields_label:
++                                            _intro += f", along with their {_fields_label}"
++                                        _intro += ":\n\n"
++
++                                        formatted = self.search_client._format_filter_result(result_str)
++                                        logging.info(f"[Agent Flow V2] {tc.function.name} direct output: {len(formatted)} chars")
++                                        yield _intro + formatted
++                                        direct_output_yielded = True
++                                    except Exception as fmt_err:
++                                        logging.warning(f"[Agent Flow V2] _format_filter_result failed ({fmt_err}); falling back to LLM")
++                                    # Submit stub: LLM only needs to add a short follow-up question
++                                    tool_outputs.append({
++                                        "tool_call_id": tc.id,
++                                        "output": f"Table with {_employee_count} employee(s) already displayed to the user. Add one short helpful follow-up question (e.g. ask if they want ratings, band, objectives, or competency for this team)."
++                                    })
++                            else:
++                                # search_knowledge_base: send full result to LLM as before
++                                max_bytes = 470_000
++                                if len(result_str.encode("utf-8")) > max_bytes:
++                                    result_str = result_str.encode("utf-8")[:max_bytes].decode("utf-8", errors="ignore")
++                                    logging.warning(f"[Agent Flow V2] {tc.function.name} output truncated to 470KB (512KB API limit)")
++                                tool_outputs.append({
++                                    "tool_call_id": tc.id,
++                                    "output": result_str
++                                })
+                         except Exception as e:
+                             logging.error(f"Error executing tool {tc.function.name}: {e}")
+                             tool_outputs.append({
+@@ -382,7 +507,7 @@ class SingleAgentRAGStrategyV2(BaseAgentStrategy):
+             stream2 = AsyncAgentRunStream(response_iterator, agents_client.runs._handle_submit_tool_outputs, event_handler)
+             
+             async with stream2 as s2:
+-                async for chunk in self._process_stream(agents_client, s2, thread_id):
++                async for chunk in self._process_stream(agents_client, s2, thread_id, user_message=user_message):
+                     yield chunk
+ 
+     async def _stream_maf_agent(self, user_message: str):
+@@ -417,8 +542,13 @@ class SingleAgentRAGStrategyV2(BaseAgentStrategy):
+             # OBO prep
+             allow_anonymous = self.cfg.get("ALLOW_ANONYMOUS", default=True, type=bool)
+             request_access_token = getattr(self, "request_access_token", None)
++            principal_email = (self.user_context or {}).get("principal_name", "") or None
+             try:
+-                self.search_client.set_request_context(api_access_token=request_access_token, allow_anonymous=allow_anonymous)
++                self.search_client.set_request_context(
++                    api_access_token=request_access_token,
++                    allow_anonymous=allow_anonymous,
++                    principal_email=principal_email,
++                )
+             except Exception:
+                 pass
+ 
+@@ -484,13 +614,49 @@ class SingleAgentRAGStrategyV2(BaseAgentStrategy):
+         self._stream_start_time = stream_start
+         t_stream = time.time()
+ 
++        # Build per-run additional_instructions to inject the logged-in user's identity.
++        # This is more reliable than a [Context: ...] message prefix because it goes
++        # directly into the system context for this specific run, even when using a
++        # pre-warmed / cached agent whose static instructions don't know who is logged in.
++        _principal_name = (self.user_context or {}).get("principal_name", "")
++        if _principal_name and _principal_name != "anonymous":
++            _additional_instructions = (
++                f"IMPORTANT: The currently authenticated user's email is {_principal_name}. "
++                f"Whenever the user uses words like 'me', 'my', 'I', or 'myself' to refer to themselves "
++                f"(e.g. 'my reportees', 'my manager', 'my team', 'who reports to me'), "
++                f"you MUST use {_principal_name} as their identity in all tool call arguments. "
++                f"For example, if asked for 'my reportees', call search_by_manager with "
++                f"manager_email=\"{_principal_name}\".\n\n"
++                f"SECURITY RESTRICTION: You are only permitted to retrieve reportee or team data for "
++                f"the logged-in user ({_principal_name}). "
++                f"If the user asks about another person's reportees or team (e.g. 'who reports to other@company.com'), "
++                f"do NOT call any search tool. Instead respond: "
++                f"'I can only retrieve reportee information for your own account. "
++                f"I'm not able to look up another person\\'s team.'"
++            )
++            logging.info(
++                "[Agent Flow V2] Injecting user identity via additional_instructions: %s",
++                _principal_name,
++            )
++        else:
++            _additional_instructions = None
++            logging.warning(
++                "[Agent Flow V2] principal_name is '%s' — user identity will NOT be injected. "
++                "Self-referential queries (e.g. 'my reportees') cannot be resolved. "
++                "Ensure the UI sends a Bearer token and OAUTH_AZURE_AD_TENANT_ID / "
++                "OAUTH_AZURE_AD_CLIENT_ID are configured.",
++                _principal_name or "empty",
++            )
++
+         try:
+             # MAF Feature: Native Real-time event streaming
+             async with await agents_client.runs.stream(
+                 thread_id=thread.id,
+-                agent_id=agent.id
++                agent_id=agent.id,
++                additional_instructions=_additional_instructions,
++                max_completion_tokens=16000,
+             ) as stream:
+-                async for chunk in self._process_stream(agents_client, stream, thread.id):
++                async for chunk in self._process_stream(agents_client, stream, thread.id, user_message=user_message):
+                     yield chunk
+ 
+         except Exception as e:

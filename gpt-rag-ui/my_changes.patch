@@ -1,0 +1,97 @@
+diff --git a/app.py b/app.py
+index 07665da..5459f16 100644
+--- a/app.py
++++ b/app.py
+@@ -5,7 +5,7 @@ import re
+ import uuid
+ import logging
+ import urllib.parse
+-from typing import Optional, Set, Tuple
++from typing import Optional, Set, Tuple, Dict
+ from datetime import datetime, timedelta
+ 
+ import chainlit as cl
+@@ -323,6 +323,28 @@ else:
+             "Set OAUTH_AZURE_AD_CLIENT_ID, OAUTH_AZURE_AD_TENANT_ID, and OAUTH_AZURE_AD_CLIENT_SECRET (or authClientSecret)."
+         )
+ 
++# EasyAuth (Azure Container Apps built-in authentication) injects the logged-in
++# user's email/UPN as X-MS-CLIENT-PRINCIPAL-NAME before requests reach Chainlit.
++# This callback turns those injected headers into a cl.User so the user icon
++# and identity are visible in the UI, and get_auth_info() picks up the email.
++@cl.header_auth_callback
++async def easyauth_header_callback(headers: Dict) -> Optional[cl.User]:
++    principal_name = (headers.get("x-ms-client-principal-name") or "").strip()
++    if not principal_name:
++        logger.debug("EasyAuth: no x-ms-client-principal-name header present.")
++        return None
++    principal_id = (headers.get("x-ms-client-principal-id") or principal_name).strip()
++    logger.info("EasyAuth: authenticated user principal=%s", principal_name)
++    return cl.User(
++        identifier=principal_name,
++        metadata={
++            "client_principal_name": principal_name,
++            "client_principal_id": principal_id,
++            "authorized": True,
++            "access_token": None,
++        },
++    )
++
+ tracer = Telemetry.get_tracer(__name__)
+ 
+ # Register feedback handlers
+@@ -417,7 +439,13 @@ async def handle_message(message: cl.Message):
+             message.id,
+             _trim_for_log(message.content),
+         )
+-        generator = call_orchestrator_stream(conversation_id, message.content, auth_info, message.id)
++        generator = call_orchestrator_stream(
++            conversation_id, message.content, auth_info, message.id,
++            user_context={
++                "principal_name": principal,
++                "principal_id": auth_info.get("client_principal_id", ""),
++            } if principal and principal != "anonymous" else None,
++        )
+ 
+         chunk_count = 0
+         first_content_seen = False
+diff --git a/orchestrator_client.py b/orchestrator_client.py
+index 3f92dbe..06968c2 100644
+--- a/orchestrator_client.py
++++ b/orchestrator_client.py
+@@ -225,7 +225,7 @@ def get_managed_identity_token():
+     return credential.get_token("https://management.azure.com/.default").token
+ 
+ 
+-async def call_orchestrator_stream(conversation_id: str, question: str, auth_info: dict, question_id: str | None = None):    
++async def call_orchestrator_stream(conversation_id: str, question: str, auth_info: dict, question_id: str | None = None, user_context: dict | None = None):
+     # Get access token from auth info
+     access_token = auth_info.get('access_token')
+     
+@@ -282,6 +282,13 @@ async def call_orchestrator_stream(conversation_id: str, question: str, auth_inf
+     if question_id:
+         payload["question_id"] = question_id
+ 
++    if user_context:
++        payload["user_context"] = user_context
++        logger.info(
++            "Forwarding user_context to orchestrator: principal=%s",
++            user_context.get("principal_name", "anonymous"),
++        )
++
+     logger.info(
+         "Invoking orchestrator: question_id=%s conversation_id=%s mode=%s url=%s headers=%s",
+         question_id or "n/a",
+diff --git a/scripts/deploy.ps1 b/scripts/deploy.ps1
+index 387d105..b0be135 100755
+--- a/scripts/deploy.ps1
++++ b/scripts/deploy.ps1
+@@ -155,7 +155,7 @@ function Get-ConfigValue {
+             --key $Key `
+             --label $label `
+             --auth-mode login `
+-            --endpoint "https://appcs-$($env:RESOURCE_TOKEN).azconfig.io" `
++            --endpoint $APP_CONFIG_ENDPOINT `
+             --query value -o tsv 2>&1
+         $exitCode = $LASTEXITCODE
+     } catch {

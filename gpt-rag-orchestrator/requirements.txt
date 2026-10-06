@@ -1,0 +1,47 @@
+# Azure SDK dependencies
+azure-keyvault-secrets==4.8.0
+azure-cosmos==4.5.1
+azure-identity==1.21.0
+azure-mgmt-web==8.0.0
+azure-mgmt-storage==22.1.1
+azure-storage-blob==12.25.1
+azure-appconfiguration==1.7.1
+azure.appconfiguration.provider
+azure-ai-projects==2.0.0b3
+azure-ai-agents>=1.2.0b4
+azure-search-documents==11.7.0b1
+
+# AI and NLP dependencies
+tiktoken==0.8.0
+openai==2.9.0
+
+# Semantic Kernel dependencies
+semantic-kernel[mcp]==1.34.0
+aiohttp==3.13.3
+pydantic==2.11.4
+
+# Authentication and token validation
+PyJWT==2.8.0
+cryptography>=42.0.0
+httpx>=0.27.0
+
+# Utility dependencies
+tenacity
+jinja2==3.1.6
+
+# For evaluation
+requests==2.32.4
+python-dotenv==1.1.0
+
+# fastapi
+fastapi==0.115.12
+uvicorn==0.34.1
+
+# NL2SQL dependencies
+sqlparse==0.5.1
+pyodbc==5.1.0
+#opentelemetry
+azure-monitor-opentelemetry
+azure-monitor-opentelemetry-exporter
+opentelemetry-instrumentation-httpx==0.52b1
+opentelemetry-instrumentation-fastapi

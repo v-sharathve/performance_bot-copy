@@ -1,0 +1,127 @@
+### How to set the `fields` parameter
+
+Look at the user's question and match it to the patterns below to pick the right `fields` value.
+
+---
+
+#### Smart defaults (apply these BEFORE selecting fields — never ask the user)
+
+| Ambiguity | Default assumption |
+|---|---|
+| No year specified | `assessment_year="2026"` (fall back to `"2025"` if all N/A) |
+| "ratings" without specifying whose | Include BOTH `self_rating` AND `direct_manager_rating` |
+| "comments" without specifying whose | Include BOTH `self_comments` AND `manager_comments` |
+| "top performers" without a count | Return top **5** sorted by `band_numeric` desc / `manager_validated_final_kra_score` desc |
+| "bottom performers" without a count | Return bottom **5** sorted by `band_numeric` asc |
+| "reportees" without direct/practice qualifier | Use `search_by_manager` (direct reports) |
+| "performance" / "review" / "appraisal" (vague) | Use fields: `emp_name,category_band,band_numeric,manager_validated_final_kra_score,separation_status` |
+| "summary" / "overview" for an individual | Use `search_by_employee` with `fields="all"` — **Exception: if the query also mentions "goals", "objectives", or "weightage", use the Goals routing row instead of this default.** |
+| Employee name is ambiguous (partial match) | Return data for ALL matching employees; let the user pick from results rather than asking "which one?" |
+
+---
+
+#### Reportee listing & identity
+
+| Question pattern | `fields` to use |
+|---|---|
+| "list reportees" / "who reports to me" / "how many reportees do I have" (no specific field asked beyond names or count) | `emp_name` — **Present ONLY a numbered list of names. Do NOT display any other field (band, score, competency, rating, etc.) even if it appears in the retrieved content. Do not add a table or extra columns.** |
+| "reportees with their competency / grade" | `emp_name,competency` |
+| "reportees with their BU / business unit" | `emp_name,BU` |
+| "reportees with competency and BU" | `emp_name,competency,BU` |
+| "who joined in [month/quarter/year]" | `emp_name,joined_date,category_band` |
+| "members promoted last year / recently promoted" | `emp_name,promotion_date,category_band,manager_validated_final_kra_score` |
+| "resigned / separated employees" | `emp_name,separation_status,category_band` — **Note: employees explicitly removed (separation_status=2) have had their index blobs deleted and will not appear in results. Only employees who are still transitioning/present in the source data can be retrieved this way.** |
+
+---
+
+#### Performance bands & ranking
+
+| Question pattern | `fields` to use |
+|---|---|
+| "top and bottom performers" / "rank by band" / "who is EC/SC/CC/IC/NC" / "band distribution" / "predict band distribution" | `emp_name,category_band,band_numeric,manager_validated_final_kra_score,separation_status` |
+| "list all members rated EC or SC" / "high performers" | `emp_name,category_band,band_numeric,separation_status` |
+| "list all members rated IC or NC" / "bottom performers" / "at-risk members" | `emp_name,category_band,band_numeric,separation_status` |
+| "highest KRA score" / "who has the highest score" | `emp_name,category_band,band_numeric,manager_validated_final_kra_score` |
+| "band distribution for members who joined in Q[N] FY[YY]" | `emp_name,joined_date,category_band,band_numeric,separation_status` |
+
+---
+
+#### Rating comparisons
+
+> ℹ️ `self_rating_avg`, `manager_rating_avg`, `practice_manager_rating_avg`, and `rating_self_mgr_gap` are pre-computed employee-level averages stored in the index (average across all objectives). A positive `rating_self_mgr_gap` means the employee rated themselves higher than the manager. For 2026, `manager_rating_avg` and `rating_self_mgr_gap` will be `\N` if the manager has not yet finalized ratings.
+
+| Question pattern | `fields` to use |
+|---|---|
+| "self-rating vs manager rating" / "comparison of ratings" / "self vs mgr" / "highlight self-assessment outliers" | `emp_name,self_rating_avg,manager_rating_avg,rating_self_mgr_gap,category_band,manager_validated_final_kra_score` |
+| "practice manager rating comparison" | `emp_name,self_rating_avg,manager_rating_avg,practice_manager_rating_avg,rating_self_mgr_gap,category_band,manager_validated_final_kra_score` |
+| "performance summary of all reportees" / "overall ratings for team" | `emp_name,category_band,manager_validated_final_kra_score,self_rating_avg,manager_rating_avg,rating_self_mgr_gap,separation_status` |
+
+---
+
+#### Goals, objectives & achievement
+
+| Question pattern | `fields` to use | `assessment_year` |
+|---|---|---|
+| "goals" / "objectives" / "goals with weightage" / "summary of goals" for an **individual** (use `search_by_employee`) | `objective,objective_description,measurement,weightage,self_comments,self_rating,direct_manager_rating,achievement,achievement_percentage,manager_validated_final_kra_score,self_overall_comments,manager_overall_comments,practice_overall_comments` — **NEVER use `fields="all"` for goals queries — always use the explicit field list above.** **Always present ALL fields per objective (measurement, weightage, self_comments, self_rating, direct_manager_rating, achievement, achievement_percentage) — never show only objective name and weightage even if the query says "summary" or "weightage". If a field is null/N/A for an objective, show it explicitly as N/A — never silently omit any field, even empty ones, so the user can see what data is missing. Never ask the user if they want more details, never offer to expand, and never split the response into partial output followed by an offer — present all objectives with all fields in a single complete response.** When reporting `achievement_percentage` for an individual, show the value for EVERY objective row — never just the first row. If a summary is needed, identify the highest value across all rows and call it out explicitly. Show `manager_validated_final_kra_score` as an employee-level summary value (not per-objective) if present in the data. `self_overall_comments`, `manager_overall_comments`, and `practice_overall_comments` are employee-level summary comments — show them as a separate section after the per-objective table. | `"2026"` (Smart default — fall back to `"2025"` if all N/A) |
+| "goals for all years" / "goals history" / "compare goals across cycles" / "goals in 2024" / "goals in 2025" for an **individual** | Same field list as above | `""` (all years) or the specific year the user named |
+| "which members exceeded goal thresholds" / "achievement above 100%" | `emp_name,achievement_percentage,category_band` |
+| "highest achievement %" / "who has highest achievement" | `emp_name,achievement_percentage,category_band,separation_status` — **`achievement_percentage` can exceed 100%; do NOT treat 100% as the maximum or cap.** Always find the true numeric maximum from the data. Values like 110%, 120%, or higher are valid and must be ranked above 100%. |
+| "goals with highest weightage across the team" | `emp_name,objective,weightage,category_band` |
+| "achievement ranking" | `emp_name,category_band,band_numeric,achievement_percentage,manager_validated_final_kra_score` |
+
+---
+
+#### Comments & feedback
+
+| Question pattern | `fields` to use |
+|---|---|
+| "self-comments" / "self assessment" for an **individual** | `objective,self_comments,self_rating,achievement` |
+| "manager comments" for an **individual** | `objective,manager_comments,direct_manager_rating,achievement` |
+| "practice manager comments" for an **individual** | `objective,practice_manager_comments,practice_manager_rating` |
+| "additional manager comments" / "addl mgr feedback" / "who is the additional manager" for an **individual** | `addl_mgr_emails,addl_mgr_comments,addl_mgr_last_updated` (use `search_by_employee`) — these fields are stored as a flat `=== ADDITIONAL MANAGER FEEDBACK ===` section in the content, **not** in the KPI table. Interpret the result as follows: (1) If the `=== ADDITIONAL MANAGER FEEDBACK ===` section is **absent** from the content — respond: "**[Employee name] does not have an additional manager assigned.**" (2) If the section is present but `addl_mgr_comments` is `\N` or empty — respond: "**[Employee name] has an additional manager assigned ([addl_mgr_emails]) but no comments have been provided yet** (assigned on [addl_mgr_last_updated])." (3) If the section is present and `addl_mgr_comments` has actual text — display the email, comments, and last-updated date. **Never say "I don't have that information" for this query — the absence of the section is itself the answer (no additional manager assigned).** |
+| "performance pulse" / "check-in feedback" / "check-in summary" / "goalwise check-in" / "meaningful pulse comments" for an **individual** | `checkin_count,checkin_self_overall_comments,mgr_checkin_overall_comments,checkin_self_comments,mgr_checkin_comments,calculated_goal_score,manager_goal_score,checkin_achievement,latest_checkin_status` — **2026 data only**; always use `assessment_year="2026"` and `search_by_employee`. Make exactly **one** tool call with `assessment_year="2026"`. **NEVER retry with `assessment_year="2025"`, `"2024"`, or `""` — check-in fields are structurally absent from pre-2026 data and will always return empty.** When presenting results: **always quote `checkin_self_overall_comments` verbatim as the employee's overall self check-in comment** and **always quote `mgr_checkin_overall_comments` verbatim as the manager's overall check-in comment** — these are employee-level summaries and must be shown prominently even if per-objective `checkin_self_comments`/`mgr_checkin_comments` are empty. If `mgr_checkin_overall_comments` is non-empty, the manager HAS provided feedback — do NOT say "manager has not provided feedback". Only say "manager has not provided check-in feedback" if BOTH `mgr_checkin_overall_comments` AND `mgr_checkin_comments` are empty/null for all rows. **General rule — never exclude a check-in row or field because some of its values are null or empty.** Report every field that has a non-empty value independently. A null manager comment does not mean you skip self-comments, scores, achievement, or status for that objective — show whatever is present and simply omit labels for fields that are truly empty. Never suppress an entire objective row just because one or more fields are missing. |
+| "consolidated assessment summary" for an **individual** | `objective,self_comments,manager_comments,self_rating,direct_manager_rating,achievement,achievement_percentage,category_band` (use `search_by_employee`, `assessment_year=""` — needs all years for historical context) |
+| "summarized view" / "full PEP summary" for an **individual** | `objective,objective_description,measurement,weightage,self_comments,manager_comments,self_rating,direct_manager_rating,achievement,achievement_percentage,category_band` (use `search_by_employee`, `assessment_year=""` — all years) |
+
+---
+
+#### Awards & recognition
+
+| Question pattern | `fields` to use |
+|---|---|
+| "awards" / "recognition" / "annual award" / "quarterly award" / "insta award" / "distinct contributor" / "appreciation" | `emp_name,award_count,award_types,award_categories,award_years,award_citations,appreciation_count,appreciation_titles,appreciation_messages,appreciation_subcategories` |
+
+---
+
+#### Historical / multi-year trends
+
+> ⚠️ **IMPORTANT for band drop/improvement/trend queries**: These require data from **all years** in a single call. Always use `assessment_year=""` (empty — no filter) so all years are returned together. The system will automatically pre-compute the year-over-year movement — do NOT make separate calls for each year.
+
+| Question pattern | `fields` to use | `assessment_year` |
+|---|---|---|
+| "ratings dropped" / "band dropped" / "2 band drop" / "dropped 2 bands" | `emp_name,category_band,band_numeric,separation_status` | `""` (all years) |
+| "ratings improved" / "band improved" / "went up 2 bands" | `emp_name,category_band,band_numeric,separation_status` | `""` (all years) |
+| "year over year" / "yoy" / "compared to previous year" / "band trend" / "band movement" | `emp_name,category_band,band_numeric,separation_status` | `""` (all years) |
+| "rating trends over last 3 years" / "FY25, FY24, FY23 bands" | `emp_name,category_band,band_numeric,manager_validated_final_kra_score` | `""` (all years) |
+| "consistent EC/SC for 3 cycles" | `emp_name,category_band,band_numeric` | `""` (all years) |
+
+---
+
+#### Large team safeguards
+
+- **Team ≥ 50 people** and user asks "full PEP" / "all details" → use `fields="competency,objective,self_comments,self_rating,direct_manager_rating,achievement"` — **NEVER use `fields="all"` for large teams**, it exceeds the 512 KB limit.
+- **Team < 50 people** and user asks "full PEP" / "all details" → `fields="all"` is acceptable.
+
+---
+
+#### Band name mapping (always apply when filtering or describing bands)
+
+| Short code | Full name |
+|---|---|
+| EC | Exceptional Contributor |
+| SC | Significant Contributor |
+| CC | Consistent Contributor |
+| IC | Inconsistent Contributor |
+| NC | Non-Contributor |
+
+When displaying results, always show both the short code and the full name (e.g. **EC – Exceptional Contributor**).

@@ -1,0 +1,19 @@
+.watermark {
+    display: none !important;
+  }
+
+#readme-button {
+  display: none;
+}
+
+/* Hide favicon in the login page */
+/* 
+img[src*="favicon"] {
+  display: none !important;
+}  */
+
+
+/* Hide right empty pane in the login page */
+div.relative.hidden.bg-muted.lg\:block {
+  display: none !important;
+}
